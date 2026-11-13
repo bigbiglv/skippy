@@ -1,20 +1,19 @@
-use crate::llm::client::{
-    build_system_prompt, emit_llm_stream, probe_ollama, stream_openai_chat, LlmStreamEvent,
-    LlmTurn,
-};
-use crate::llm::downloader::{download_file_with_progress, emit_download_progress, DownloadProgressEvent};
-use crate::llm::llama_supervisor::{
-    install_llama_runtime as install_llama_runtime_impl, wait_for_llama_ready, LlamaSupervisor,
-};
+use crate::llm::client::probe_ollama;
+use crate::llm::downloader::{emit_download_progress, DownloadProgressEvent};
+use crate::llm::llama_supervisor::{install_llama_runtime as install_llama_runtime_impl, LlamaSupervisor};
+use crate::llm::runner::{ensure_llama_ready_for_model, execute_chat_turn, SendMessageResult};
 use crate::models::registry::{
     default_gguf_path, find_gguf_spec, gguf_download_url, list_catalog_with_state,
     resolve_model_gguf_path, set_active_model, set_model_local_path, ModelCatalogItem,
 };
-use crate::state::{AppState, RuntimeStatus, VoiceStage};
+use crate::state::{AppState, RuntimeStatus};
 use crate::storage::chat_repo::{
-    append_message, create_session, delete_session, get_all_settings, list_messages,
-    list_sessions, resolve_local_storage_dir, set_setting, update_message_content,
-    update_session_title, ChatMessage, ChatSession,
+    create_session, delete_session, get_all_settings, list_messages, list_sessions,
+    resolve_local_storage_dir, set_setting, ChatMessage, ChatSession,
+};
+use crate::voice::assets::{
+    download_voice_model as download_voice_model_impl, ensure_silero_vad, find_sherpa_c_api_dll,
+    install_sherpa_runtime, voice_models_root,
 };
 use crate::worker::supervisor::{wait_for_health, WorkerHealth};
 use serde::Serialize;
@@ -56,6 +55,7 @@ fn sync_status_snapshot(
         (running, loaded)
     };
     let llama_ready = LlamaSupervisor::find_binary(storage_dir).is_some();
+    let voice_ready = find_sherpa_c_api_dll(storage_dir).is_some();
 
     let mut status = state.status.lock().map_err(|e| e.to_string())?;
     status.python_worker_running = worker_running;
@@ -63,6 +63,7 @@ fn sync_status_snapshot(
     status.llama_runtime_ready = llama_ready;
     status.llama_server_running = llama_running;
     status.llama_loaded_model = llama_model;
+    status.voice_runtime_ready = voice_ready;
     status.local_storage_dir = storage_dir.to_string_lossy().to_string();
     status.ollama_connected = ollama_connected;
     status.ollama_models = ollama_models;
@@ -120,59 +121,10 @@ pub fn get_session_messages(
     list_messages(&db, &session_id).map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Serialize)]
-pub struct SendMessageResult {
-    pub user_message: ChatMessage,
-    pub assistant_message: ChatMessage,
-    pub session_title: Option<String>,
-}
-
-async fn ensure_llama_ready_for_model(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    storage_dir: &Path,
-    model_id: &str,
-    gguf_path: &Path,
-) -> Result<String, String> {
-    let (base_url, newly_spawned) = {
-        let mut llama = state.llama.lock().map_err(|e| e.to_string())?;
-        llama.spawn_for_model(storage_dir, model_id, gguf_path)?
-    };
-
-    if newly_spawned {
-        let wait_res = wait_for_llama_ready(app, &base_url, || {
-            state
-                .llama
-                .lock()
-                .ok()
-                .and_then(|mut l| l.take_exit_error())
-        })
-        .await;
-
-        if let Err(err) = wait_res {
-            if let Ok(mut l) = state.llama.lock() {
-                l.stop();
-            }
-            if let Ok(mut st) = state.status.lock() {
-                st.llama_server_running = false;
-                st.llama_loaded_model = None;
-            }
-            return Err(err);
-        }
-    }
-
-    if let Ok(mut st) = state.status.lock() {
-        st.llama_runtime_ready = true;
-        st.llama_server_running = true;
-        st.llama_loaded_model = Some(model_id.to_string());
-    }
-
-    Ok(base_url)
-}
-
 #[tauri::command]
 pub fn stop_generation(state: State<'_, AppState>) -> Result<(), String> {
     state.chat_cancel.store(true, Ordering::Relaxed);
+    state.tts.stop_speaking();
     Ok(())
 }
 
@@ -181,372 +133,26 @@ pub async fn send_text_message(
     app: AppHandle,
     session_id: String,
     content: String,
-    state: State<'_, AppState>,
 ) -> Result<SendMessageResult, String> {
-    state.chat_cancel.store(false, Ordering::Relaxed);
-
-    let (
-        storage_dir,
-        settings,
-        active_model,
-        user_message,
-        assistant_placeholder,
-        history,
-        new_session_title,
-        prev_stage,
-        prev_stage_label,
-    ) = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
-        let settings = get_all_settings(&db).map_err(|e| e.to_string())?;
-        let models = list_catalog_with_state(&db, &storage_dir).map_err(|e| e.to_string())?;
-
-        let active_model = models
-            .into_iter()
-            .find(|m| m.category == "llm" && m.is_active)
-            .ok_or_else(|| "尚未选择对话大脑模型，请先打开「模型管理」选择一个模型".to_string())?;
-
-        let sessions = list_sessions(&db).map_err(|e| e.to_string())?;
-        let current_title = sessions
-            .into_iter()
-            .find(|s| s.id == session_id)
-            .map(|s| s.title)
-            .unwrap_or_default();
-
-        let auto_title = if current_title.starts_with("欢迎使用 Skippy")
-            || current_title.starts_with("新对话")
-        {
-            let compact: String = content.trim().chars().take(18).collect();
-            if !compact.is_empty() {
-                let _ = update_session_title(&db, &session_id, &compact);
-                Some(compact)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let existing_messages = list_messages(&db, &session_id).map_err(|e| e.to_string())?;
-        let user_message = append_message(&db, &session_id, "user", "pc_text", &content, None)
-            .map_err(|e| e.to_string())?;
-
-        let placeholder = append_message(
-            &db,
-            &session_id,
-            "assistant",
-            "pc_text",
-            "",
-            Some(&active_model.name),
-        )
-        .map_err(|e| e.to_string())?;
-
-        let persona = settings
-            .get("persona_mode")
-            .map(String::as_str)
-            .unwrap_or("butler");
-        let mut turns = vec![LlmTurn {
-            role: "system".to_string(),
-            content: build_system_prompt(persona),
-        }];
-        let recent_start = existing_messages.len().saturating_sub(14);
-        for m in &existing_messages[recent_start..] {
-            if m.source == "system" || m.content.trim().is_empty() {
-                continue;
-            }
-            turns.push(LlmTurn {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            });
-        }
-        turns.push(LlmTurn {
-            role: "user".to_string(),
-            content: content.clone(),
-        });
-
-        let mut st = state.status.lock().map_err(|e| e.to_string())?;
-        let prev_stage = st.stage.clone();
-        let prev_label = st.stage_label.clone();
-        st.stage = VoiceStage::Thinking;
-        st.stage_label = format!("正在准备 {}...", active_model.name);
-
-        (
-            storage_dir,
-            settings,
-            active_model,
-            user_message,
-            placeholder,
-            turns,
-            auto_title,
-            prev_stage,
-            prev_label,
-        )
-    };
-
-    let msg_id = assistant_placeholder.id.clone();
-
-    emit_llm_stream(
-        &app,
-        LlmStreamEvent {
-            session_id: session_id.clone(),
-            message_id: msg_id.clone(),
-            delta: String::new(),
-            full_content: String::new(),
-            stage: "preparing".to_string(),
-            done: false,
-            cancelled: false,
-            error: None,
-        },
-    );
-
-    let stream_res: Result<(String, bool, String), String> = match active_model.engine.as_str() {
-        "llama-server" => {
-            let gguf_path = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                resolve_model_gguf_path(&db, &storage_dir, &active_model.id)
-            };
-
-            match gguf_path {
-                None => Err(format!(
-                    "尚未下载或导入「{}」权重文件（.gguf）。\n请点击右上角「模型管理」，下载权重或导入本机已有 .gguf 文件。",
-                    active_model.name
-                )),
-                Some(path) => {
-                    emit_llm_stream(
-                        &app,
-                        LlmStreamEvent {
-                            session_id: session_id.clone(),
-                            message_id: msg_id.clone(),
-                            delta: String::new(),
-                            full_content: String::new(),
-                            stage: "loading_model".to_string(),
-                            done: false,
-                            cancelled: false,
-                            error: None,
-                        },
-                    );
-
-                    match ensure_llama_ready_for_model(
-                        &app,
-                        &state,
-                        &storage_dir,
-                        &active_model.id,
-                        &path,
-                    )
-                    .await
-                    {
-                        Ok(base_url) => {
-                            let endpoint = format!("{base_url}/v1/chat/completions");
-                            stream_openai_chat(
-                                &app,
-                                &session_id,
-                                &msg_id,
-                                &endpoint,
-                                None,
-                                &active_model.id,
-                                history,
-                                &state.chat_cancel,
-                            )
-                            .await
-                            .map(|(text, cancelled)| {
-                                if let Ok(mut l) = state.llama.lock() {
-                                    l.touch();
-                                }
-                                (text, cancelled, active_model.name.clone())
-                            })
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            }
-        }
-        "ollama" => {
-            let base_url = settings
-                .get("ollama_base_url")
-                .map(String::as_str)
-                .unwrap_or("http://127.0.0.1:11434")
-                .trim_end_matches('/');
-            let configured_model = settings
-                .get("ollama_model")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let model_name = if !configured_model.is_empty() {
-                configured_model
-            } else {
-                let (ok, tags) = probe_ollama(base_url).await;
-                if !ok {
-                    return finish_failed_chat(
-                        &app,
-                        &state,
-                        &session_id,
-                        user_message,
-                        assistant_placeholder,
-                        new_session_title,
-                        prev_stage,
-                        prev_stage_label,
-                        format!("无法连接到本机 Ollama（{base_url}），请确认 Ollama 已启动，或切换为 Skippy 内置本地 GGUF 模型。"),
-                    );
-                }
-                tags.into_iter().next().unwrap_or_default()
-            };
-
-            if model_name.is_empty() {
-                Err("本机 Ollama 中未找到可用模型，请先 `ollama pull` 模型或使用内置 GGUF 模型。".to_string())
-            } else {
-                let endpoint = format!("{base_url}/v1/chat/completions");
-                stream_openai_chat(
-                    &app,
-                    &session_id,
-                    &msg_id,
-                    &endpoint,
-                    None,
-                    &model_name,
-                    history,
-                    &state.chat_cancel,
-                )
-                .await
-                .map(|(text, cancelled)| (text, cancelled, format!("Ollama · {model_name}")))
-            }
-        }
-        "cloud" => {
-            let base_url = settings
-                .get("cloud_base_url")
-                .map(String::as_str)
-                .unwrap_or("")
-                .trim_end_matches('/');
-            let api_key = settings
-                .get("cloud_api_key")
-                .map(String::as_str)
-                .unwrap_or("");
-            let cloud_model = settings
-                .get("cloud_model")
-                .map(String::as_str)
-                .unwrap_or("");
-
-            if base_url.is_empty() || api_key.trim().is_empty() || cloud_model.trim().is_empty() {
-                Err("当前选中了云端 API，但尚未配置 API Key / Model ID；请打开「设置」填写，或在「模型管理」切换回本地 GGUF 模型。".to_string())
-            } else {
-                let endpoint = format!("{base_url}/chat/completions");
-                stream_openai_chat(
-                    &app,
-                    &session_id,
-                    &msg_id,
-                    &endpoint,
-                    Some(api_key),
-                    cloud_model,
-                    history,
-                    &state.chat_cancel,
-                )
-                .await
-                .map(|(text, cancelled)| (text, cancelled, cloud_model.to_string()))
-            }
-        }
-        other => Err(format!("暂不支持的大脑引擎类型：{other}")),
-    };
-
-    if let Ok(mut st) = state.status.lock() {
-        st.stage = prev_stage.clone();
-        st.stage_label = prev_stage_label.clone();
-    }
-
-    match stream_res {
-        Ok((text, cancelled, model_label)) => {
-            let final_text = if text.trim().is_empty() && cancelled {
-                "（已停止生成）".to_string()
-            } else if text.trim().is_empty() {
-                "（模型未返回内容）".to_string()
-            } else {
-                text
-            };
-
-            {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                update_message_content(&db, &msg_id, &final_text, Some(&model_label))
-                    .map_err(|e| e.to_string())?;
-            }
-
-            emit_llm_stream(
-                &app,
-                LlmStreamEvent {
-                    session_id: session_id.clone(),
-                    message_id: msg_id.clone(),
-                    delta: String::new(),
-                    full_content: final_text.clone(),
-                    stage: "done".to_string(),
-                    done: true,
-                    cancelled,
-                    error: None,
-                },
-            );
-
-            let mut final_assistant = assistant_placeholder;
-            final_assistant.content = final_text;
-            final_assistant.model_used = Some(model_label);
-
-            Ok(SendMessageResult {
-                user_message,
-                assistant_message: final_assistant,
-                session_title: new_session_title,
-            })
-        }
-        Err(err) => finish_failed_chat(
-            &app,
-            &state,
-            &session_id,
-            user_message,
-            assistant_placeholder,
-            new_session_title,
-            prev_stage,
-            prev_stage_label,
-            err,
-        ),
-    }
+    execute_chat_turn(&app, &session_id, &content, "pc_text", false).await
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish_failed_chat(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    session_id: &str,
-    user_message: ChatMessage,
-    mut assistant_placeholder: ChatMessage,
-    session_title: Option<String>,
-    prev_stage: VoiceStage,
-    prev_stage_label: String,
-    err: String,
-) -> Result<SendMessageResult, String> {
-    if let Ok(mut st) = state.status.lock() {
-        st.stage = prev_stage;
-        st.stage_label = prev_stage_label;
-    }
+#[tauri::command]
+pub fn start_voice_capture(session_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.voice.start_manual(session_id);
+    Ok(())
+}
 
-    let friendly = format!("推理未完成：\n{err}");
-    if let Ok(db) = state.db.lock() {
-        let _ = update_message_content(&db, &assistant_placeholder.id, &friendly, Some("system-error"));
-    }
+#[tauri::command]
+pub fn stop_voice_capture(state: State<'_, AppState>) -> Result<(), String> {
+    state.voice.stop_manual();
+    Ok(())
+}
 
-    emit_llm_stream(
-        app,
-        LlmStreamEvent {
-            session_id: session_id.to_string(),
-            message_id: assistant_placeholder.id.clone(),
-            delta: String::new(),
-            full_content: friendly.clone(),
-            stage: "error".to_string(),
-            done: true,
-            cancelled: false,
-            error: Some(err),
-        },
-    );
-
-    assistant_placeholder.content = friendly;
-    assistant_placeholder.model_used = Some("system-error".to_string());
-
-    Ok(SendMessageResult {
-        user_message,
-        assistant_message: assistant_placeholder,
-        session_title,
-    })
+#[tauri::command]
+pub fn stop_speaking(state: State<'_, AppState>) -> Result<(), String> {
+    state.voice.barge_in_stop();
+    Ok(())
 }
 
 #[tauri::command]
@@ -555,22 +161,18 @@ pub fn select_active_model(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ModelCatalogItem>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
-    set_active_model(&db, &category, &model_id).map_err(|e| e.to_string())?;
+    let items = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
+        set_active_model(&db, &category, &model_id).map_err(|e| e.to_string())?;
+        list_catalog_with_state(&db, &storage_dir).map_err(|e| e.to_string())?
+    };
 
-    if category == "kws" {
-        let mut status = state.status.lock().map_err(|e| e.to_string())?;
-        if model_id == "shortcut-only" {
-            status.stage = VoiceStage::ShortcutOnly;
-            status.stage_label = "待机低占用（快捷键唤醒）".to_string();
-        } else {
-            status.stage = VoiceStage::IdleListening;
-            status.stage_label = "待机监听中（Step 3 接入音频流）".to_string();
-        }
+    if category == "kws" || category == "asr" || category == "tts" {
+        state.voice.reload_config();
     }
 
-    list_catalog_with_state(&db, &storage_dir).map_err(|e| e.to_string())
+    Ok(items)
 }
 
 #[tauri::command]
@@ -579,19 +181,29 @@ pub fn update_app_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    set_setting(&db, &key, &value).map_err(|e| e.to_string())?;
+    let settings = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        set_setting(&db, &key, &value).map_err(|e| e.to_string())?;
 
-    if key == "local_storage_dir" {
-        let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
-        let llama_ready = LlamaSupervisor::find_binary(&storage_dir).is_some();
-        if let Ok(mut st) = state.status.lock() {
-            st.local_storage_dir = storage_dir.to_string_lossy().to_string();
-            st.llama_runtime_ready = llama_ready;
+        if key == "local_storage_dir" {
+            let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
+            let llama_ready = LlamaSupervisor::find_binary(&storage_dir).is_some();
+            let voice_ready = find_sherpa_c_api_dll(&storage_dir).is_some();
+            if let Ok(mut st) = state.status.lock() {
+                st.local_storage_dir = storage_dir.to_string_lossy().to_string();
+                st.llama_runtime_ready = llama_ready;
+                st.voice_runtime_ready = voice_ready;
+            }
         }
+
+        get_all_settings(&db).map_err(|e| e.to_string())?
+    };
+
+    if matches!(key.as_str(), "wake_word" | "local_storage_dir" | "voice_reply_enabled") {
+        state.voice.reload_config();
     }
 
-    get_all_settings(&db).map_err(|e| e.to_string())
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -643,6 +255,98 @@ pub async fn install_llama_runtime(
 }
 
 #[tauri::command]
+pub async fn install_voice_suite(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
+    state.download_cancel.store(false, Ordering::Relaxed);
+
+    let (storage_dir, mirror_prefix) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = get_all_settings(&db).map_err(|e| e.to_string())?;
+        let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
+        let mirror_prefix = settings.get("github_mirror").cloned().unwrap_or_default();
+        (storage_dir, mirror_prefix)
+    };
+
+    if find_sherpa_c_api_dll(&storage_dir).is_none() {
+        install_sherpa_runtime(&app, &storage_dir, &mirror_prefix, &state.download_cancel).await?;
+    }
+    ensure_silero_vad(&app, &storage_dir, &mirror_prefix, &state.download_cancel).await?;
+    download_voice_model_impl(
+        &app,
+        &storage_dir,
+        "sherpa-kws-zh-en",
+        &mirror_prefix,
+        &state.download_cancel,
+    )
+    .await?;
+    download_voice_model_impl(
+        &app,
+        &storage_dir,
+        "sensevoice-small-int8",
+        &mirror_prefix,
+        &state.download_cancel,
+    )
+    .await?;
+
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        set_active_model(&db, "kws", "sherpa-kws-zh-en").map_err(|e| e.to_string())?;
+        set_active_model(&db, "asr", "sensevoice-small-int8").map_err(|e| e.to_string())?;
+    }
+    state.voice.reload_config();
+
+    get_app_snapshot(state).await
+}
+
+#[tauri::command]
+pub async fn download_voice_model(
+    app: AppHandle,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ModelCatalogItem>, String> {
+    state.download_cancel.store(false, Ordering::Relaxed);
+
+    let (storage_dir, mirror_prefix) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = get_all_settings(&db).map_err(|e| e.to_string())?;
+        let storage_dir = resolve_local_storage_dir(&db, &state.data_dir);
+        let mirror_prefix = settings.get("github_mirror").cloned().unwrap_or_default();
+        (storage_dir, mirror_prefix)
+    };
+
+    if let Err(err) = download_voice_model_impl(
+        &app,
+        &storage_dir,
+        &model_id,
+        &mirror_prefix,
+        &state.download_cancel,
+    )
+    .await
+    {
+        emit_download_progress(
+            &app,
+            DownloadProgressEvent {
+                target_id: model_id.clone(),
+                stage: "error".to_string(),
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                percent: 0,
+                message: err.clone(),
+                done: true,
+                error: Some(err.clone()),
+            },
+        );
+        return Err(err);
+    }
+
+    state.voice.reload_config();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    list_catalog_with_state(&db, &storage_dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn download_gguf_model(
     app: AppHandle,
     model_id: String,
@@ -668,7 +372,7 @@ pub async fn download_gguf_model(
     let dest_path = default_gguf_path(&storage_dir, spec.filename);
     let url = gguf_download_url(spec, &chosen_mirror);
 
-    if let Err(err) = download_file_with_progress(
+    if let Err(err) = crate::llm::downloader::download_file_with_progress(
         &app,
         &model_id,
         &format!("正在下载 {}", spec.filename),
@@ -761,6 +465,20 @@ pub fn delete_local_model(
         if existing.starts_with(&managed_root) {
             let _ = fs::remove_file(&existing);
         }
+    } else if model_id == "sherpa-kws-zh-en"
+        || model_id == "sensevoice-small-int8"
+        || model_id == "paraformer-zh-streaming"
+    {
+        let folder = match model_id.as_str() {
+            "sherpa-kws-zh-en" => "kws-zh-en",
+            "paraformer-zh-streaming" => "paraformer-zh-int8",
+            _ => "sensevoice-int8",
+        };
+        let target = voice_models_root(&storage_dir).join(folder);
+        if target.exists() {
+            let _ = fs::remove_dir_all(&target);
+        }
+        state.voice.reload_config();
     }
     set_model_local_path(&db, "llm", &model_id, None, false).map_err(|e| e.to_string())?;
     list_catalog_with_state(&db, &storage_dir).map_err(|e| e.to_string())
@@ -789,7 +507,7 @@ pub async fn start_llama_server(
         (storage_dir, target, path)
     };
 
-    ensure_llama_ready_for_model(&app, &state, &storage_dir, &target_model_id, &gguf_path).await?;
+    ensure_llama_ready_for_model(&app, &storage_dir, &target_model_id, &gguf_path).await?;
 
     let status = state.status.lock().map_err(|e| e.to_string())?;
     let ollama_ok = status.ollama_connected;

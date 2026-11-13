@@ -1,6 +1,6 @@
 # Skippy 开发待办清单 (TODO)
 
-> **当前阶段**：Phase 1 - Step 2 纯本地大模型接入与流式对话已完成（内置托管 `llama-server` CUDA + D 盘 GGUF 下载/导入 + 流式对话闭环），下一步进入 Step 3（语音唤醒、识别与播报）
+> **当前阶段**：Phase 1 - Step 3 纯本地离线语音闭环已接入（`cpal` 麦克风采集 + `sherpa-onnx` KWS 唤醒 / Silero VAD / SenseVoice 离线识别 + Windows 离线 SAPI + `rodio` Barge-in 播报），下一步联调实测并进入 Step 4 / Phase 2
 > **最后更新**：2026-11-13
 
 ---
@@ -26,19 +26,20 @@
 - [x] 完善 `App.vue`：流式打字机输出、Qwen3 `<think>` 思考过程折叠卡片、基础 Markdown 代码块渲染、停止生成、会话自动命名
 - [x] 完善 `ModelHubModal.vue` 与 `SettingsModal.vue`：D 盘目录选择、GGUF 权重下载器（魔搭 ModelScope / HF-Mirror 镜像切换 + 实时进度条 + 取消）、本地 `.gguf` 文件导入与删除
 
-### Step 3：语音唤醒、识别与播报闭环
-- [ ] 音频采集模块（`cpal` WASAPI 事件驱动 + 无锁 SPSC 环形缓冲）
-- [ ] 接入 `sherpa-onnx`：
-  - [ ] 本地唤醒词检测（KWS，默认 `"Skippy"`，支持切换为“仅快捷键模式”）
-  - [ ] Silero VAD 语音端点检测（预留语义轮次完结判断接口）
+### Step 3：语音唤醒、识别与播报闭环（纯本地引擎已接入，待实机安装套件联调）
+- [x] 音频采集模块（`cpal` WASAPI 采集 + 重采样 16kHz + 预缓冲环形队列，`shortcut-only` 模式自动释放麦克风）
+- [x] 接入 `sherpa-onnx`（Rust 动态绑定 `sherpa-onnx-c-api.dll` + 一键安装包下载到 D 盘）：
+  - [x] 本地唤醒词检测（KWS Zipformer，`默认 "Skippy"`，支持切换为“仅快捷键模式”）
+  - [x] Silero VAD 语音端点检测（含能量门限兜底）
   - [ ] 可选声纹过滤（防止电脑外放视频/音乐误触发）
-  - [ ] 本地 CPU 离线识别（`SenseVoice-Small INT8` / `Paraformer-zh-streaming`）
-- [ ] 语音播报与播放控制：
-  - [ ] `rodio` 音频队列播放 + **Barge-in 语音插话打断**
+  - [x] 本地 CPU 离线识别（`SenseVoice-Small INT8` / `Paraformer-zh`）
+- [x] 语音播报与播放控制：
+  - [x] `rodio` 音频队列播放 + **Barge-in 打断**（唤醒词/点击停止立即清空播放队列）
   - [ ] Windows 媒体音量压低与恢复（Audio Ducking）
-  - [ ] 分句流式 TTS 管道 + 唤醒 0ms 提示音预反馈
-  - [ ] 接入 `Edge-TTS`（在线免部署）、`Windows WinRT TTS`（离线兜底）、`Kokoro-82M`（CPU ONNX 离线）
-- [ ] 对话历史记录自动写入语音来源 (`pc_voice`) 并实时同步到已打开的 GUI
+  - [x] 分句流式 TTS 管道（自动过滤 `<think>`）+ 唤醒/结束纯 PCM 提示音预反馈
+  - [x] Windows 本机离线 SAPI 语音合成（纯离线 `System.Speech` 生成 WAV + `rodio` 播放，默认激活）
+  - [ ] 可选扩展：`Edge-TTS`（在线） / `Kokoro-82M`（CPU ONNX）
+- [x] 对话历史记录自动写入语音来源 (`pc_voice`) 并实时同步到已打开的 GUI（`chat-turn-started` + `voice-status` 事件）
 
 ### Step 4：按需预热与 GPU Worker 深度推理集成
 - [x] 通过 `mise` 安装 Python 3.12 (`worker/.venv`) 并搭建按需 FastAPI AI Worker 服务骨架 (`worker/server.py`)

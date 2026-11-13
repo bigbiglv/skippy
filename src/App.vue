@@ -15,6 +15,7 @@ import {
   Smartphone,
   Square,
   Trash2,
+  VolumeX,
 } from "lucide-vue-next";
 import ModelHubModal from "./components/ModelHubModal.vue";
 import SettingsModal from "./components/SettingsModal.vue";
@@ -22,12 +23,14 @@ import type {
   AppSnapshot,
   ChatMessage,
   ChatSession,
+  ChatTurnStartedEvent,
   DownloadProgressEvent,
   LlmStreamEvent,
   ModelCatalogItem,
   ModelCategory,
   RuntimeStatus,
   SendMessageResult,
+  VoiceStatusEvent,
 } from "./types/skippy";
 
 const loading = ref(true);
@@ -52,6 +55,7 @@ const status = ref<RuntimeStatus>({
   llama_runtime_ready: false,
   llama_server_running: false,
   llama_loaded_model: null,
+  voice_runtime_ready: false,
   local_storage_dir: "D:\\SkippyData",
   gpu_vram_active_mb: 0,
 });
@@ -59,6 +63,9 @@ const workerBusy = ref(false);
 const workerError = ref("");
 const llamaBusy = ref(false);
 const llamaError = ref("");
+const voiceBusy = ref(false);
+const voiceError = ref("");
+const voiceRecording = ref(false);
 const downloadProgress = ref<Record<string, DownloadProgressEvent>>({});
 const sessions = ref<ChatSession[]>([]);
 const activeSessionId = ref<string>("");
@@ -406,6 +413,58 @@ async function handleStopWorker() {
   }
 }
 
+async function handleToggleMic() {
+  if (!isTauriRuntime) return;
+  if (voiceRecording.value) {
+    try {
+      await invoke("stop_voice_capture");
+    } catch (err) {
+      voiceError.value = String(err);
+    }
+    return;
+  }
+  voiceError.value = "";
+  try {
+    await invoke("start_voice_capture", {
+      sessionId: activeSessionId.value || null,
+    });
+  } catch (err) {
+    voiceError.value = String(err);
+  }
+}
+
+async function handleStopSpeaking() {
+  if (!isTauriRuntime) return;
+  await invoke("stop_speaking");
+}
+
+async function handleInstallVoiceSuite() {
+  voiceBusy.value = true;
+  voiceError.value = "";
+  try {
+    const snap = await invoke<AppSnapshot>("install_voice_suite");
+    status.value = snap.status;
+    models.value = snap.models;
+    settings.value = snap.settings;
+  } catch (err) {
+    voiceError.value = String(err);
+  } finally {
+    voiceBusy.value = false;
+  }
+}
+
+async function handleDownloadVoice(modelId: string) {
+  voiceError.value = "";
+  try {
+    models.value = await invoke<ModelCatalogItem[]>("download_voice_model", {
+      modelId,
+    });
+    await refreshSnapshotStatus();
+  } catch (err) {
+    voiceError.value = String(err);
+  }
+}
+
 function sourceLabel(source: ChatMessage["source"]): string {
   switch (source) {
     case "pc_voice":
@@ -421,6 +480,8 @@ function sourceLabel(source: ChatMessage["source"]): string {
 
 let unlistenDownload: UnlistenFn | null = null;
 let unlistenStream: UnlistenFn | null = null;
+let unlistenVoice: UnlistenFn | null = null;
+let unlistenTurnStarted: UnlistenFn | null = null;
 
 onMounted(async () => {
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
@@ -435,10 +496,51 @@ onMounted(async () => {
       };
     });
 
+    unlistenVoice = await listen<VoiceStatusEvent>("voice-status", (evt) => {
+      const p = evt.payload;
+      status.value = {
+        ...status.value,
+        stage: p.stage,
+        stage_label: p.stage_label,
+      };
+      voiceRecording.value = p.recording;
+      if (p.error) {
+        voiceError.value = p.error;
+      }
+    });
+
+    unlistenTurnStarted = await listen<ChatTurnStartedEvent>("chat-turn-started", (evt) => {
+      const p = evt.payload;
+      if (p.session_title) {
+        const targetSession = sessions.value.find((s) => s.id === p.session_id);
+        if (targetSession) targetSession.title = p.session_title;
+      }
+      if (p.session_id !== activeSessionId.value) return;
+
+      const hasRealUser = messages.value.some((m) => m.id === p.user_message.id);
+      const hasRealAsst = messages.value.some((m) => m.id === p.assistant_message.id);
+      if (hasRealUser && hasRealAsst) return;
+
+      const tempUserIdx = messages.value.findIndex((m) => m.id.startsWith("temp-user-"));
+      if (tempUserIdx !== -1) {
+        messages.value[tempUserIdx] = p.user_message;
+      } else if (!hasRealUser) {
+        messages.value.push(p.user_message);
+      }
+
+      const tempAsstIdx = messages.value.findIndex((m) => m.id.startsWith("temp-assistant-"));
+      if (tempAsstIdx !== -1) {
+        messages.value[tempAsstIdx] = p.assistant_message;
+      } else if (!hasRealAsst) {
+        messages.value.push(p.assistant_message);
+      }
+      scrollToBottom();
+    });
+
     unlistenStream = await listen<LlmStreamEvent>("llm-stream", (evt) => {
       const p = evt.payload;
       if (p.session_id !== activeSessionId.value) return;
-      streamStage.value = p.stage;
+      streamStage.value = p.done || p.cancelled || p.error ? "" : p.stage;
 
       const idx = messages.value.findIndex(
         (m) => m.id === p.message_id || m.id.startsWith("temp-assistant-"),
@@ -450,6 +552,9 @@ onMounted(async () => {
         };
         scrollToBottom();
       }
+      if (p.done || p.cancelled || p.error) {
+        void refreshSnapshotStatus();
+      }
     });
   }
 
@@ -459,6 +564,8 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenDownload?.();
   unlistenStream?.();
+  unlistenVoice?.();
+  unlistenTurnStarted?.();
 });
 </script>
 
@@ -522,6 +629,16 @@ onUnmounted(() => {
         {{ loadError }}
       </div>
 
+      <div
+        v-if="voiceError"
+        class="flex items-center justify-between border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
+      >
+        <span>语音提示：{{ voiceError }}</span>
+        <button class="ml-3 text-[11px] font-medium hover:underline" @click="voiceError = ''">
+          关闭
+        </button>
+      </div>
+
       <!-- Top Bar -->
       <header class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
         <div class="flex items-center gap-2.5">
@@ -536,12 +653,32 @@ onUnmounted(() => {
           <div
             class="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300"
           >
-            <span class="h-2 w-2 rounded-full bg-emerald-500" />
+            <span
+              class="h-2 w-2 rounded-full"
+              :class="{
+                'bg-red-500 animate-pulse': status.stage === 'recording',
+                'bg-blue-500 animate-pulse': status.stage === 'speaking',
+                'bg-amber-500 animate-pulse': status.stage === 'thinking',
+                'bg-emerald-500':
+                  status.stage !== 'recording' &&
+                  status.stage !== 'speaking' &&
+                  status.stage !== 'thinking',
+              }"
+            />
             <span>{{ status.stage_label }}</span>
           </div>
         </div>
 
         <div class="flex items-center gap-2">
+          <button
+            v-if="status.stage === 'speaking'"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-900/50 dark:bg-blue-950/40 dark:text-blue-300"
+            title="立即打断并停止语音播报"
+            @click="handleStopSpeaking"
+          >
+            <VolumeX class="h-3.5 w-3.5" />
+            <span>停止播报</span>
+          </button>
           <button
             class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
             @click="modelHubOpen = true"
@@ -610,7 +747,7 @@ onUnmounted(() => {
             </div>
 
             <div
-              v-if="msg.role === 'assistant' && !msg.content && sending && msg.id.startsWith('temp-assistant-')"
+              v-if="msg.role === 'assistant' && !msg.content && (sending || Boolean(streamStage))"
               class="text-xs text-zinc-400"
             >
               {{ streamStage === "loading_model" ? "正在加载本地模型至 RTX 5070 显存..." : "Skippy 思考中..." }}
@@ -646,8 +783,14 @@ onUnmounted(() => {
           class="flex items-end gap-2 rounded-xl border border-zinc-200 bg-zinc-50/70 p-2 focus-within:border-blue-500 focus-within:bg-white dark:border-zinc-800 dark:bg-zinc-900 dark:focus-within:bg-zinc-900"
         >
           <button
-            class="rounded-lg p-2 text-zinc-400 hover:bg-zinc-200/60 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-            title="语音收音将在 Step 3 接入"
+            class="rounded-lg p-2 transition"
+            :class="
+              voiceRecording
+                ? 'animate-pulse bg-red-500 text-white hover:bg-red-600'
+                : 'text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200'
+            "
+            :title="voiceRecording ? '正在聆听，点击立即结束收音并识别' : '点击说话（纯本地离线语音识别 + 播报）'"
+            @click="handleToggleMic"
           >
             <Mic class="h-4 w-4" />
           </button>
@@ -690,6 +833,9 @@ onUnmounted(() => {
       :llama-runtime-ready="status.llama_runtime_ready"
       :llama-server-running="status.llama_server_running"
       :llama-loaded-model="status.llama_loaded_model"
+      :voice-runtime-ready="status.voice_runtime_ready"
+      :voice-busy="voiceBusy"
+      :voice-error="voiceError"
       :local-storage-dir="status.local_storage_dir"
       :download-mirror="settings.download_mirror || 'modelscope'"
       :download-progress="downloadProgress"
@@ -702,6 +848,8 @@ onUnmounted(() => {
       @install-llama="handleInstallLlama"
       @start-llama="handleStartLlama"
       @stop-llama="handleStopLlama"
+      @install-voice-suite="handleInstallVoiceSuite"
+      @download-voice="handleDownloadVoice"
       @download-model="handleDownloadModel"
       @cancel-download="handleCancelDownload"
       @import-gguf="handleImportGguf"

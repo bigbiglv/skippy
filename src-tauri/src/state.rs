@@ -1,4 +1,6 @@
 use crate::llm::llama_supervisor::LlamaSupervisor;
+use crate::voice::engine::VoiceController;
+use crate::voice::tts::TtsPlayer;
 use crate::worker::supervisor::{PythonEnvInfo, WorkerSupervisor};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,7 @@ pub struct RuntimeStatus {
     pub llama_runtime_ready: bool,
     pub llama_server_running: bool,
     pub llama_loaded_model: Option<String>,
+    pub voice_runtime_ready: bool,
     pub local_storage_dir: String,
     pub gpu_vram_active_mb: u32,
 }
@@ -36,6 +39,7 @@ impl RuntimeStatus {
     pub fn with_env(
         python_env: PythonEnvInfo,
         llama_runtime_ready: bool,
+        voice_runtime_ready: bool,
         local_storage_dir: String,
     ) -> Self {
         Self {
@@ -48,6 +52,7 @@ impl RuntimeStatus {
             llama_runtime_ready,
             llama_server_running: false,
             llama_loaded_model: None,
+            voice_runtime_ready,
             local_storage_dir,
             gpu_vram_active_mb: 0,
         }
@@ -60,6 +65,8 @@ pub struct AppState {
     pub status: Mutex<RuntimeStatus>,
     pub worker: Mutex<WorkerSupervisor>,
     pub llama: Mutex<LlamaSupervisor>,
+    pub tts: TtsPlayer,
+    pub voice: VoiceController,
     pub chat_cancel: Arc<AtomicBool>,
     pub download_cancel: Arc<AtomicBool>,
     pub should_exit: AtomicBool,

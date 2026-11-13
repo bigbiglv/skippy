@@ -1,3 +1,6 @@
+use crate::voice::assets::{
+    find_asr_paths, find_kws_paths, find_voice_asset_spec, is_voice_model_installed,
+};
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -356,7 +359,8 @@ pub fn list_catalog_with_state(conn: &Connection, storage_dir: &Path) -> Result<
                 .unwrap_or((false, false, None));
 
             let spec = find_gguf_spec(def.id);
-            let downloadable = spec.is_some();
+            let voice_spec = find_voice_asset_spec(def.id);
+            let downloadable = spec.is_some() || voice_spec.is_some();
 
             let (is_installed, local_path) = if def.engine == "llama-server" {
                 let valid_db = db_path.as_ref().filter(|p| Path::new(p).exists()).cloned();
@@ -367,6 +371,20 @@ pub fn list_catalog_with_state(conn: &Connection, storage_dir: &Path) -> Result<
 
                 let resolved = valid_db.or(disk_default);
                 (resolved.is_some(), resolved)
+            } else if def.engine == "sherpa-onnx" {
+                let installed = is_voice_model_installed(storage_dir, def.id);
+                let resolved_path = if installed {
+                    if def.category == "kws" {
+                        find_kws_paths(storage_dir, "Skippy")
+                            .map(|p| p.root.to_string_lossy().to_string())
+                    } else {
+                        find_asr_paths(storage_dir, def.id)
+                            .and_then(|p| p.model_onnx.parent().map(|d| d.to_string_lossy().to_string()))
+                    }
+                } else {
+                    None
+                };
+                (installed, resolved_path)
             } else {
                 (db_installed, db_path)
             };

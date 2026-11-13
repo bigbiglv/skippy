@@ -84,6 +84,41 @@ const emit = defineEmits<{
           </div>
         </div>
 
+        <!-- Voice Wake & Speech Settings -->
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-semibold text-zinc-700 dark:text-zinc-300">语音唤醒词</label>
+            <input
+              type="text"
+              :value="settings.wake_word || 'Skippy'"
+              placeholder="Skippy"
+              class="mt-2 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+              @change="emit('update', 'wake_word', ($event.target as HTMLInputElement).value)"
+            />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-zinc-700 dark:text-zinc-300">语音问答播报</label>
+            <div class="mt-2 grid grid-cols-2 gap-1.5">
+              <button
+                v-for="opt in [
+                  { k: 'true', l: '朗读回复' },
+                  { k: 'false', l: '静音文字' },
+                ]"
+                :key="opt.k"
+                class="rounded-lg border px-2 py-2 text-xs font-medium transition"
+                :class="
+                  (settings.voice_reply_enabled ?? 'true') === opt.k
+                    ? 'border-blue-500 bg-blue-50 text-blue-600 dark:bg-blue-950/40 dark:text-blue-400'
+                    : 'border-zinc-200 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800'
+                "
+                @click="emit('update', 'voice_reply_enabled', opt.k)"
+              >
+                {{ opt.l }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <!-- Idle Unload -->
         <div>
           <label class="block text-xs font-semibold text-zinc-700 dark:text-zinc-300">

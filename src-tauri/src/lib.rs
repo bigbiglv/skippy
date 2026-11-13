@@ -3,6 +3,7 @@ mod llm;
 mod models;
 mod state;
 mod storage;
+mod voice;
 mod worker;
 
 use llm::llama_supervisor::LlamaSupervisor;
@@ -15,6 +16,9 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use voice::assets::find_sherpa_c_api_dll;
+use voice::engine::VoiceController;
+use voice::tts::TtsPlayer;
 use worker::supervisor::WorkerSupervisor;
 
 pub fn show_or_recreate_main_window(app: &AppHandle) {
@@ -69,7 +73,10 @@ pub fn run() {
             let python_env = worker.detect_env();
             let storage_dir = resolve_local_storage_dir(&conn, &data_dir);
             let llama_ready = LlamaSupervisor::find_binary(&storage_dir).is_some();
+            let voice_ready = find_sherpa_c_api_dll(&storage_dir).is_some();
             let llama = LlamaSupervisor::new(18766);
+            let tts = TtsPlayer::new(storage_dir.join("_tts_tmp"));
+            let voice = VoiceController::spawn(app.handle().clone(), tts.clone());
 
             app.manage(AppState {
                 db: Mutex::new(conn),
@@ -77,10 +84,13 @@ pub fn run() {
                 status: Mutex::new(RuntimeStatus::with_env(
                     python_env,
                     llama_ready,
+                    voice_ready,
                     storage_dir.to_string_lossy().to_string(),
                 )),
                 worker: Mutex::new(worker),
                 llama: Mutex::new(llama),
+                tts,
+                voice,
                 chat_cancel: Arc::new(AtomicBool::new(false)),
                 download_cancel: Arc::new(AtomicBool::new(false)),
                 should_exit: AtomicBool::new(false),
@@ -159,6 +169,7 @@ pub fn run() {
                     "open" => show_or_recreate_main_window(app),
                     "quit" => {
                         let state = app.state::<AppState>();
+                        state.voice.shutdown();
                         if let Ok(mut w) = state.worker.lock() {
                             w.stop();
                         }
@@ -210,9 +221,14 @@ pub fn run() {
             commands::get_session_messages,
             commands::send_text_message,
             commands::stop_generation,
+            commands::start_voice_capture,
+            commands::stop_voice_capture,
+            commands::stop_speaking,
             commands::select_active_model,
             commands::update_app_setting,
             commands::install_llama_runtime,
+            commands::install_voice_suite,
+            commands::download_voice_model,
             commands::download_gguf_model,
             commands::cancel_download,
             commands::import_local_gguf,

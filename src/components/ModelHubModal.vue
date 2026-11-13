@@ -31,6 +31,9 @@ const props = defineProps<{
   llamaRuntimeReady: boolean;
   llamaServerRunning: boolean;
   llamaLoadedModel: string | null;
+  voiceRuntimeReady: boolean;
+  voiceBusy: boolean;
+  voiceError: string;
   localStorageDir: string;
   downloadMirror: string;
   downloadProgress: Record<string, DownloadProgressEvent>;
@@ -46,6 +49,8 @@ const emit = defineEmits<{
   (e: "install-llama"): void;
   (e: "start-llama", modelId?: string): void;
   (e: "stop-llama"): void;
+  (e: "install-voice-suite"): void;
+  (e: "download-voice", modelId: string): void;
   (e: "download-model", modelId: string): void;
   (e: "cancel-download"): void;
   (e: "import-gguf", modelId: string): void;
@@ -90,6 +95,20 @@ const activeLocalLlm = computed(() =>
 );
 
 const runtimeDownload = computed(() => props.downloadProgress["llama-runtime"]);
+
+const voiceSuiteReady = computed(() => {
+  const hasKws = props.models.some((m) => m.id === "sherpa-kws-zh-en" && m.is_installed);
+  const hasAsr = props.models.some((m) => m.id === "sensevoice-small-int8" && m.is_installed);
+  return props.voiceRuntimeReady && hasKws && hasAsr;
+});
+
+const activeVoiceDownload = computed(() => {
+  for (const key of ["sherpa-runtime", "silero-vad", "sherpa-kws-zh-en", "sensevoice-small-int8"]) {
+    const item = props.downloadProgress[key];
+    if (item && !item.done) return item;
+  }
+  return null;
+});
 
 function formatDisk(mb: number): string {
   if (mb === 0) return "0 MB";
@@ -185,7 +204,7 @@ function formatBytes(bytes: number): string {
               </span>
 
               <span
-                v-if="item.engine === 'llama-server'"
+                v-if="item.engine === 'llama-server' || item.engine === 'sherpa-onnx'"
                 class="rounded-md px-1.5 py-0.5 text-[11px] font-medium"
                 :class="
                   item.is_installed
@@ -193,7 +212,7 @@ function formatBytes(bytes: number): string {
                     : 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400'
                 "
               >
-                {{ item.is_installed ? "权重已就绪" : "待下载/导入" }}
+                {{ item.is_installed ? "权重已就绪" : item.engine === "llama-server" ? "待下载/导入" : "待下载" }}
               </span>
 
               <span
@@ -327,6 +346,26 @@ function formatBytes(bytes: number): string {
                 <Trash2 class="h-3 w-3" />
               </button>
             </div>
+
+            <div v-else-if="item.engine === 'sherpa-onnx'" class="flex items-center gap-1">
+              <button
+                v-if="item.downloadable && !item.is_installed"
+                :disabled="Boolean(downloadProgress[item.id] && !downloadProgress[item.id].done)"
+                class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-[11px] text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                :title="`下载并解压到 ${localStorageDir}\\models\\sherpa`"
+                @click="emit('download-voice', item.id)"
+              >
+                <Download class="h-3 w-3" /> 下载
+              </button>
+              <button
+                v-if="item.is_installed"
+                class="rounded-md border border-zinc-200 p-1 text-zinc-400 hover:border-red-300 hover:text-red-500 dark:border-zinc-700"
+                title="删除已下载的语音模型目录"
+                @click="emit('delete-model', item.id)"
+              >
+                <Trash2 class="h-3 w-3" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -412,6 +451,72 @@ function formatBytes(bytes: number): string {
           </div>
           <p v-if="llamaError || runtimeDownload?.error" class="text-[11px] text-red-600 dark:text-red-400">
             {{ llamaError || runtimeDownload?.error }}
+          </p>
+        </div>
+
+        <!-- Local Voice Suite (Sherpa-ONNX KWS + VAD + SenseVoice) -->
+        <div class="space-y-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span
+                class="h-2 w-2 rounded-full"
+                :class="
+                  voiceSuiteReady
+                    ? 'bg-emerald-500'
+                    : voiceRuntimeReady
+                      ? 'bg-blue-500'
+                      : 'bg-amber-500'
+                "
+              />
+              <span class="font-medium text-zinc-800 dark:text-zinc-200">
+                本地语音引擎 (Sherpa-ONNX 唤醒 + VAD + SenseVoice)：
+                <template v-if="voiceSuiteReady">已就绪（离线唤醒/识别可用，纯 CPU 0 显存）</template>
+                <template v-else-if="voiceRuntimeReady">运行库已装，待下载唤醒与识别模型</template>
+                <template v-else>待安装（约 210 MB，纯 CPU 0 显存）</template>
+              </span>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <button
+                v-if="!voiceSuiteReady"
+                :disabled="voiceBusy || Boolean(activeVoiceDownload)"
+                class="inline-flex items-center gap-1 rounded-md bg-blue-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-blue-700 disabled:opacity-40"
+                @click="emit('install-voice-suite')"
+              >
+                <Download class="h-3 w-3" />
+                {{ voiceBusy || activeVoiceDownload ? "安装语音套件中..." : "一键安装语音套件" }}
+              </button>
+              <span
+                v-else
+                class="rounded-md bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300"
+              >
+                离线语音就绪
+              </span>
+            </div>
+          </div>
+
+          <div
+            v-if="activeVoiceDownload"
+            class="space-y-1 pt-1"
+          >
+            <div class="flex items-center justify-between text-[11px] text-blue-600 dark:text-blue-400">
+              <span>{{ activeVoiceDownload.message }}</span>
+              <div class="flex items-center gap-2">
+                <span>{{ activeVoiceDownload.percent }}%</span>
+                <button class="text-red-500 hover:underline" @click="emit('cancel-download')">
+                  取消
+                </button>
+              </div>
+            </div>
+            <div class="h-1.5 w-full overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+              <div
+                class="h-full rounded-full bg-blue-600 transition-all"
+                :style="{ width: `${activeVoiceDownload.percent}%` }"
+              />
+            </div>
+          </div>
+          <p v-if="voiceError" class="text-[11px] text-red-600 dark:text-red-400">
+            {{ voiceError }}
           </p>
         </div>
 

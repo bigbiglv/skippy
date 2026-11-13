@@ -72,6 +72,7 @@ fn seed_defaults(conn: &Connection, data_dir: Option<&Path>) -> Result<()> {
         ("shortcut", "Alt+Space"),
         ("idle_unload_secs", "180"),
         ("audio_ducking", "true"),
+        ("voice_reply_enabled", "true"),
         ("persona_mode", "butler"),
         ("local_storage_dir", storage_dir.as_str()),
         ("download_mirror", "modelscope"),
@@ -103,8 +104,8 @@ fn seed_defaults(conn: &Connection, data_dir: Option<&Path>) -> Result<()> {
         ("llm", "llama-qwen3-8b-gguf", 1, 0),
         ("llm", "llama-uitars-1.5-7b-gguf", 0, 0),
         ("llm", "ollama-external", 0, 0),
-        ("tts", "edge-tts-online", 1, 1),
-        ("tts", "winrt-native-tts", 0, 1),
+        ("tts", "edge-tts-online", 0, 1),
+        ("tts", "winrt-native-tts", 1, 1),
         ("tts", "kokoro-82m-zh", 0, 0),
         ("tts", "cosyvoice-gpu-worker", 0, 0),
     ];
@@ -149,6 +150,34 @@ fn seed_defaults(conn: &Connection, data_dir: Option<&Path>) -> Result<()> {
         }
         conn.execute(
             "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('migrated_local_default_v1', '1')",
+            [],
+        )?;
+    }
+
+    let tts_migrated: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'migrated_local_tts_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if tts_migrated.is_none() {
+        let edge_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM model_configs WHERE category = 'tts' AND model_id = 'edge-tts-online'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if edge_active != 0 {
+            conn.execute("UPDATE model_configs SET is_active = 0 WHERE category = 'tts'", [])?;
+            conn.execute(
+                "UPDATE model_configs SET is_active = 1 WHERE category = 'tts' AND model_id = 'winrt-native-tts'",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('migrated_local_tts_v1', '1')",
             [],
         )?;
     }

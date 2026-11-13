@@ -24,6 +24,7 @@ export interface RuntimeStatus {
   llama_runtime_ready: boolean;
   llama_server_running: boolean;
   llama_loaded_model: string | null;
+  voice_runtime_ready: boolean;
   local_storage_dir: string;
   gpu_vram_active_mb: number;
 }
@@ -100,4 +101,20 @@ export interface LlmStreamEvent {
   done: boolean;
   cancelled: boolean;
   error?: string | null;
+}
+
+export interface VoiceStatusEvent {
+  stage: VoiceStage;
+  stage_label: string;
+  recording: boolean;
+  kws_active: boolean;
+  transcript?: string | null;
+  error?: string | null;
+}
+
+export interface ChatTurnStartedEvent {
+  session_id: string;
+  user_message: ChatMessage;
+  assistant_message: ChatMessage;
+  session_title?: string | null;
 }

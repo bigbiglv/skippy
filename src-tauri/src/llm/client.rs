@@ -93,6 +93,7 @@ pub async fn stream_openai_chat(
     model_name: &str,
     messages: Vec<LlmTurn>,
     cancel_flag: &AtomicBool,
+    mut on_answer_delta: Option<&mut (dyn FnMut(&str) + Send)>,
 ) -> Result<(String, bool), String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -177,6 +178,9 @@ pub async fn stream_openai_chat(
                     out_delta.push_str("</think>\n\n");
                 }
                 out_delta.push_str(content_piece);
+                if let Some(cb) = on_answer_delta.as_deref_mut() {
+                    cb(content_piece);
+                }
             }
 
             if !out_delta.is_empty() {
