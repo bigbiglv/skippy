@@ -92,15 +92,27 @@ pub fn kws_model_dir(storage_dir: &Path) -> Option<PathBuf> {
     has_kws_model_files(storage_dir).then(|| voice_models_root(storage_dir).join("kws-zh-en"))
 }
 
+fn find_preferred_kws_component(dir: &Path, role: &str) -> Option<PathBuf> {
+    find_file_recursive(dir, 2, |n| {
+        n.starts_with(role) && n.contains("chunk-8") && n.ends_with(".onnx") && !n.ends_with(".int8.onnx")
+    })
+    .or_else(|| {
+        find_file_recursive(dir, 2, |n| {
+            n.starts_with(role) && n.contains("chunk-16") && n.ends_with(".onnx") && !n.ends_with(".int8.onnx")
+        })
+    })
+    .or_else(|| find_file_recursive(dir, 2, |n| n.starts_with(role) && n.ends_with(".onnx")))
+}
+
 pub fn find_kws_paths(storage_dir: &Path, wake_word: &str) -> Option<KwsModelPaths> {
     let dir = voice_models_root(storage_dir).join("kws-zh-en");
     if !dir.exists() {
         return None;
     }
 
-    let encoder = find_file_recursive(&dir, 2, |n| n.starts_with("encoder") && n.ends_with(".onnx"))?;
-    let decoder = find_file_recursive(&dir, 2, |n| n.starts_with("decoder") && n.ends_with(".onnx"))?;
-    let joiner = find_file_recursive(&dir, 2, |n| n.starts_with("joiner") && n.ends_with(".onnx"))?;
+    let encoder = find_preferred_kws_component(&dir, "encoder")?;
+    let decoder = find_preferred_kws_component(&dir, "decoder")?;
+    let joiner = find_preferred_kws_component(&dir, "joiner")?;
     let tokens = find_file_recursive(&dir, 2, |n| n == "tokens.txt")?;
     let en_phone = find_file_recursive(&dir, 2, |n| n == "en.phone");
     let base_kw = find_file_recursive(&dir, 2, |n| n == "keywords.txt");
@@ -192,6 +204,11 @@ fn prepare_keywords_file(
 
         if let Some(tokenized) = tokenize_wake_phrase(trimmed, &token_set, en_phone_path) {
             lines.push(format!("{tokenized} @{trimmed}"));
+            // 中文日常口语里“阿”常轻读为中性音 a（如“密探阿泰”常读作 mì tàn a tài），补充变体提高唤醒率
+            if trimmed.contains('阿') && tokenized.contains(" ā ") && token_set.contains("a") {
+                let neutral = tokenized.replace(" ā ", " a ");
+                lines.push(format!("{neutral} @{trimmed}"));
+            }
         }
     }
 

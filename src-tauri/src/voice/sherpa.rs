@@ -381,7 +381,7 @@ impl<'a> SherpaKws<'a> {
         let c_tok = path_cstring(tokens)?;
         let c_kw_file = path_cstring(keywords_file)?;
         let c_prov = CString::new("cpu").unwrap();
-        let c_empty = CString::new("").unwrap();
+        let c_unit = CString::new("cjkchar").unwrap();
 
         let mut cfg: SherpaOnnxKeywordSpotterConfig = unsafe { std::mem::zeroed() };
         cfg.feat_config.sample_rate = 16000;
@@ -392,11 +392,11 @@ impl<'a> SherpaKws<'a> {
         cfg.model_config.tokens = c_tok.as_ptr();
         cfg.model_config.num_threads = 2;
         cfg.model_config.provider = c_prov.as_ptr();
-        cfg.model_config.modeling_unit = c_empty.as_ptr();
+        cfg.model_config.modeling_unit = c_unit.as_ptr();
         cfg.max_active_paths = 4;
         cfg.num_trailing_blanks = 1;
-        cfg.keywords_score = 1.0;
-        cfg.keywords_threshold = 0.25;
+        cfg.keywords_score = 1.5;
+        cfg.keywords_threshold = 0.18;
         cfg.keywords_file = c_kw_file.as_ptr();
 
         unsafe {
@@ -776,4 +776,41 @@ fn path_cstring(p: &Path) -> Result<CString, String> {
 #[allow(dead_code)]
 fn _assert_null_ptr() -> *const c_void {
     ptr::null()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::voice::assets::{find_kws_paths, find_sherpa_c_api_dll};
+
+    #[test]
+    fn kws_initializes_if_local_assets_installed() {
+        let storage = Path::new("D:\\SkippyData");
+        let Some(dll) = find_sherpa_c_api_dll(storage) else {
+            return;
+        };
+        let Some(kws_paths) = find_kws_paths(storage, "密探阿泰") else {
+            return;
+        };
+        assert!(
+            kws_paths
+                .encoder
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.contains("chunk-8")),
+            "expected chunk-8 fp32 encoder, got {:?}",
+            kws_paths.encoder
+        );
+        let rt = SherpaRuntime::load(&dll).expect("load sherpa dll");
+        let kws = SherpaKws::new(
+            &rt,
+            &kws_paths.encoder,
+            &kws_paths.decoder,
+            &kws_paths.joiner,
+            &kws_paths.tokens,
+            &kws_paths.keywords_file,
+        )
+        .expect("init kws");
+        assert!(kws.feed_and_detect(&vec![0.0f32; 1600]).is_none());
+    }
 }

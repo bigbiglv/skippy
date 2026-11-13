@@ -96,6 +96,9 @@ pub fn run() {
                 should_exit: AtomicBool::new(false),
             });
 
+            // AppState 注册完成后再触发一次配置重载，避免后台语音线程启动早于 app.manage 导致首轮读取为空
+            app.state::<AppState>().voice.reload_config();
+
             // 后台空闲超时回收循环（Idle TTL）：自动终止闲置的 Worker 与 llama-server 释放内存与显存
             let reaper_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

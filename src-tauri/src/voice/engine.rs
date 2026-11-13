@@ -139,11 +139,17 @@ fn update_voice_status(
     );
 }
 
-fn idle_stage_for_kws(kws_active: bool) -> (VoiceStage, &'static str) {
+fn idle_stage_for_kws(kws_active: bool, wake_word: &str) -> (VoiceStage, String) {
     if kws_active {
-        (VoiceStage::IdleListening, "语音待机监听中（说唤醒词即可对话）")
+        let w = wake_word.trim();
+        let label = if w.is_empty() {
+            "语音待机监听中".to_string()
+        } else {
+            format!("语音待机监听中（说「{w}」唤醒）")
+        };
+        (VoiceStage::IdleListening, label)
     } else {
-        (VoiceStage::ShortcutOnly, "待机低占用（快捷键唤醒）")
+        (VoiceStage::ShortcutOnly, "待机低占用（快捷键唤醒）".to_string())
     }
 }
 
@@ -155,6 +161,7 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
     let mut manual_stop_requested = false;
     let mut manual_session_id: Option<String> = None;
     let mut kws_wanted = false;
+    let mut active_wake_word = "密探阿泰".to_string();
     let mut pre_roll: VecDeque<f32> = VecDeque::with_capacity(6400);
     let mut recorded_samples: Vec<f32> = Vec::new();
     let mut speech_seen = false;
@@ -168,13 +175,18 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
 
     loop {
         if config_dirty {
+            let Some(bundle) = read_runtime_bundle(&app) else {
+                // AppState 尚未 manage 完成时保留 config_dirty，稍后重试
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            };
             config_dirty = false;
             kws_holder.take();
             vad_holder.take();
 
-            if let Some(bundle) = read_runtime_bundle(&app) {
-                kws_wanted = bundle.kws_id != "shortcut-only";
-                if kws_wanted {
+            active_wake_word = bundle.wake_word.clone();
+            kws_wanted = bundle.kws_id != "shortcut-only";
+            if kws_wanted {
                     if let (Some(dll), Some(kws_paths)) = (
                         find_sherpa_c_api_dll(&bundle.storage_dir),
                         find_kws_paths(&bundle.storage_dir, &bundle.wake_word),
@@ -218,10 +230,11 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                                             }
                                         }
                                     }
+                                    let (st, lb) = idle_stage_for_kws(true, &active_wake_word);
                                     update_voice_status(
                                         &app,
-                                        VoiceStage::IdleListening,
-                                        "语音待机监听中",
+                                        st,
+                                        &lb,
                                         false,
                                         true,
                                         None,
@@ -258,20 +271,19 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                             None,
                         );
                     }
-                } else {
-                    if !recording {
-                        mic_handle = None;
-                    }
-                    update_voice_status(
-                        &app,
-                        VoiceStage::ShortcutOnly,
-                        "待机低占用（快捷键唤醒）",
-                        false,
-                        false,
-                        None,
-                        None,
-                    );
+            } else {
+                if !recording {
+                    mic_handle = None;
                 }
+                update_voice_status(
+                    &app,
+                    VoiceStage::ShortcutOnly,
+                    "待机低占用（快捷键唤醒）",
+                    false,
+                    false,
+                    None,
+                    None,
+                );
             }
         }
 
@@ -292,8 +304,8 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                     tts.stop_speaking();
                     let state = app.state::<AppState>();
                     state.chat_cancel.store(true, Ordering::Relaxed);
-                    let (st, lb) = idle_stage_for_kws(kws_holder.is_some());
-                    update_voice_status(&app, st, lb, false, kws_holder.is_some(), None, None);
+                    let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
+                    update_voice_status(&app, st, &lb, false, kws_holder.is_some(), None, None);
                 }
                 VoiceCmd::StopManual => {
                     if recording {
@@ -477,8 +489,8 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                     }
 
                     if samples.len() < 3200 || !speech_seen {
-                        let (st, lb) = idle_stage_for_kws(kws_holder.is_some());
-                        update_voice_status(&app, st, lb, false, kws_holder.is_some(), None, None);
+                        let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
+                        update_voice_status(&app, st, &lb, false, kws_holder.is_some(), None, None);
                         break;
                     }
 
@@ -512,11 +524,11 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                                     Ok(raw_text) => {
                                         let text = clean_asr_output(&raw_text);
                                         if text.is_empty() {
-                                            let (st, lb) = idle_stage_for_kws(kws_holder.is_some());
+                                            let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
                                             update_voice_status(
                                                 &app,
                                                 st,
-                                                lb,
+                                                &lb,
                                                 false,
                                                 kws_holder.is_some(),
                                                 None,
@@ -528,15 +540,16 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                                                 text,
                                                 manual_session_id.take(),
                                                 kws_holder.is_some(),
+                                                active_wake_word.clone(),
                                             );
                                         }
                                     }
                                     Err(err) => {
-                                        let (st, lb) = idle_stage_for_kws(kws_holder.is_some());
+                                        let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
                                         update_voice_status(
                                             &app,
                                             st,
-                                            lb,
+                                            &lb,
                                             false,
                                             kws_holder.is_some(),
                                             None,
@@ -545,11 +558,11 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                                     }
                                 },
                                 Err(err) => {
-                                    let (st, lb) = idle_stage_for_kws(kws_holder.is_some());
+                                    let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
                                     update_voice_status(
                                         &app,
                                         st,
-                                        lb,
+                                        &lb,
                                         false,
                                         kws_holder.is_some(),
                                         None,
@@ -575,6 +588,7 @@ fn dispatch_voice_prompt(
     transcript: String,
     preferred_session_id: Option<String>,
     kws_active: bool,
+    wake_word: String,
 ) {
     let session_id = {
         let state = app.state::<AppState>();
@@ -607,8 +621,8 @@ fn dispatch_voice_prompt(
 
     tauri::async_runtime::spawn(async move {
         let _ = execute_chat_turn(&app, &session_id, &transcript, "pc_voice", true).await;
-        let (st, lb) = idle_stage_for_kws(kws_active);
-        update_voice_status(&app, st, lb, false, kws_active, None, None);
+        let (st, lb) = idle_stage_for_kws(kws_active, &wake_word);
+        update_voice_status(&app, st, &lb, false, kws_active, None, None);
     });
 }
 
