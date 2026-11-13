@@ -14,7 +14,7 @@
 
 ### 不可妥协的核心约束
 1. **收起/待机极致低占用**：用户关闭 GUI 窗口后，必须销毁 WebView 渲染进程（`ExitRequested` + `prevent_exit()` 保留托盘），仅保留 Rust 核心常驻系统托盘，待机目标：内存约 **40~80 MB**、CPU **~1%**、GPU 显存 **0 MB**（不影响日常打游戏）。
-2. **唤醒后满血按需调度**：语音唤醒或手机发指令后，允许按需热拉起本地大模型（Ollama）或重型 GPU 语音 Worker（Python Sidecar），空闲超时（如 2~3 分钟）自动卸载显存或终止 Worker 进程。
+2. **唤醒后满血按需调度（开箱即用不强制外置服务）**：语音唤醒或手机发指令后，由 Skippy 内置托管按需拉起本地推理引擎（`llama-server` Sidecar）或重型 GPU 语音 Worker，空闲超时（如 2~3 分钟）直接终止子进程，由操作系统 100% 瞬间回收内存与显存。
 3. **跨设备与可维护性**：所有会话历史、状态机、模型配置与未来局域网服务全部由 Rust 后端持有，GUI 只是按需打开的展示/交互壳。
 
 ---
@@ -28,7 +28,7 @@
 | **本地数据库** | **SQLite (`rusqlite`)** | 会话、消息历史、模型配置与系统设置 |
 | **音频收发** | **`cpal` (WASAPI 事件驱动) + `rodio`** | 低功耗收音、环形缓冲、Audio Ducking、播报打断 |
 | **轻语音引擎 (一期内嵌)** | **`sherpa-onnx` + `Edge-TTS` / `WinRT TTS`** | KWS 唤醒 + Silero VAD + 声纹 + CPU `SenseVoice`/`Paraformer` + 零占用/离线兜底 TTS |
-| **大模型接入** | **`Ollama` API + OpenAI 兼容云端 API** | 自动同步已拉取模型、支持 `pull` 下载与 `keep_alive` 卸载 |
+| **大模型接入** | **内置托管 `llama-server` Sidecar + 兼容 `Ollama` + 云端 OpenAI 兼容 API** | 默认内置按需拉起 GGUF（开箱免装 Ollama）；同时支持检测复用本机已有 Ollama |
 | **重型 GPU 语音 / 视觉 (按需 Worker)** | **Python Sidecar (FastAPI/HTTP)** | 预留用于 `Qwen3-ASR`、`CosyVoice`/`Index-TTS`、以及二期视觉兜底 |
 | **Windows 操控 (二期)** | **Rust `uiautomation` / `windows-rs` + `AppsFolder` + SMTC** | 混合分层：系统 API 优先 -> UIA 控件树 -> Set-of-Mark 视觉兜底 |
 | **局域网手机端 (三期)** | **Rust `axum` (HTTP + WebSocket)** | 内嵌于常驻内核，扫码配对 + Token 鉴权 + 手机网页复用 Vue 界面 |
@@ -46,7 +46,7 @@
   - **纯快捷键模式**：完全关闭麦克风监听（不触发 Windows 任务栏麦克风隐私橙色小图标）。
 - **并发预热**：检测到唤醒词瞬间，一边提示音 + Audio Ducking 压低背景音乐 + 本地环形缓冲录音，一边异步预热 LLM / Worker。
 - **语音打断 (Barge-in)**：播报过程中再次唤醒或插话时，立即清空 `rodio` 播放队列并切回聆听态。
-- **空闲自动卸载 (Idle TTL)**：无交互超时自动向 Ollama 发送 `keep_alive: 0` 并终止按需 Python Worker。
+- **空闲自动卸载 (Idle TTL)**：无交互超时自动终止按需托管的 `llama-server` / Python Worker（若连接外置 Ollama 则发送 `keep_alive: 0`）。
 
 #### 1.2 GUI 页面规划
 1. **常规 AI 对话页 (`App.vue`)**
@@ -58,13 +58,13 @@
    - 按 **4 个功能分类** 管理与单选切换：
      - **语音唤醒 (`kws`)**：仅快捷键模式 / `sherpa-onnx Zipformer KWS` / `openWakeWord`
      - **语音识别 (`asr`)**：`SenseVoice-Small (INT8, CPU)` / `Paraformer-zh-streaming (CPU)` / `Qwen3-ASR (0.6B/1.7B, GPU Worker)` / 云端兼容 ASR
-     - **对话大脑 (`llm`)**：本地 Ollama（自动同步 `/api/tags` + 推荐清单一键 `pull` + 预留二期 `[视觉控电脑]` 如 `UI-TARS-1.5-7B`） / 云端 OpenAI 兼容 API（DeepSeek / Qwen / OpenAI / Gemini 等）
+     - **对话大脑 (`llm`)**：Skippy 内置托管 GGUF（`Qwen3-4B/8B`、二期 `[视觉控电脑]` `UI-TARS-1.5-7B`，首次选用自动下载 `llama-server` 运行时与 GGUF 权重，免装 Ollama）/ 可选连接已有 Ollama（`/api/tags` 复用）/ 云端 OpenAI 兼容 API（DeepSeek / Qwen / OpenAI / Gemini 等）
      - **语音合成 (`tts`)**：`Edge-TTS`（在线免部署）/ `Windows WinRT 原生 TTS` / `Kokoro-82M (CPU 离线)` / `CosyVoice & Index-TTS (GPU Worker 声音克隆)`
    - 底部提供 **RTX 5070 12GB 显存预算预估条** 与 **闲置自动卸载时间设置**。
 
-#### 1.3 无 Python / 无 Ollama 环境下的降级运行策略
-- **没有 Ollama 时**：使用云端 OpenAI 兼容 API 跑通完整对话、流式输出、语音唤醒与 TTS 播报闭环。
-- **没有 Python 时**：使用纯 Rust 的 `sherpa-onnx`（唤醒 + `SenseVoice` CPU 识别）+ `Edge-TTS` / `WinRT TTS` / `Kokoro-82M` 跑通完整语音链路；GPU 重型语音模型标记为“需主力机 Python Worker”。
+#### 1.3 环境降级与免配置策略
+- **无 Ollama 环境**：Skippy 默认通过内置托管的轻量 **`llama-server` (`llama.cpp` CUDA) Sidecar** 直接运行本地 GGUF 模型（与云端 API 共用同一套 OpenAI 兼容流式协议），不需要用户单独安装维护 Ollama 服务；若检测到本机已装 Ollama 也支持一键复用。
+- **无 Python 环境**：使用纯 Rust 的 `sherpa-onnx`（唤醒 + `SenseVoice` CPU 识别）+ `Edge-TTS` / `WinRT TTS` / `Kokoro-82M` 跑通完整语音链路；GPU 重型语音模型标记为“需主力机 Python Worker”。
 
 ---
 
@@ -94,5 +94,5 @@
 ## 4. 关键架构决策记录 (ADR)
 
 1. **为什么不用现成开源语音助手仓库魔改？**：成品多为纯 Python（无法实现关闭 GUI 后几十 MB 常驻）或绑定 Linux (`systemd`/`D-Bus`)，改造成本高于使用 Tauri v2 搭干净底座并按需调用开源库/引擎。
-2. **为什么选纯 Rust `sherpa-onnx` + Ollama + 可选按需 Python Worker？**：平时待机内存极低且无 Python 环境污染；主力机跑重型 GPU 语音/视觉时又能通过子进程“用时拉起、用完即杀”彻底回收显存。
+2. **为什么用内置托管 `llama-server` Sidecar 替代强绑 Ollama，同时保留 Ollama 兼容？**：直接打包完整 Ollama 会让安装包膨胀到数百 MB~1GB+，且与用户已有 Ollama 抢端口；内置 `llama-server.exe` 仅几十 MB，直接暴露 OpenAI 兼容接口，真正做到待机 0 进程、唤醒拉起、超时即杀，用户无需另装服务即可开箱使用本地大模型（若本机已有 Ollama 也可直接复用）。
 3. **跨电脑开发约定**：模型权重、SQLite 数据库与 API Key 均存放在系统用户本地数据目录（如 `%LocalAppData%\com.bigbiglv.skippy\`），不入 Git 仓库。

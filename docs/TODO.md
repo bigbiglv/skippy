@@ -18,11 +18,14 @@
 - [x] 实现 SQLite 建表与基础 CRUD（`sessions`、`messages`、`model_configs`、`app_settings`）
 
 ### Step 2：文字对话流式闭环与模型管理中心（下一步）
-- [ ] 实现统一 `LlmProvider` Trait
-- [ ] 接入 **OpenAI 兼容云端 API**（支持自定义 Base URL / API Key / Model ID 与 SSE 流式输出，当前开发机可直接验证）
-- [ ] 接入 **Ollama HTTP Client**（检测服务状态、同步 `/api/tags`、一键 `/api/pull` 进度推送、`keep_alive` 参数控制）
+- [ ] 实现统一 `LlmProvider` Trait（基于 OpenAI 兼容流式协议，一套代码通吃本地与云端）
+- [ ] 接入 **OpenAI 兼容云端 API**（支持自定义 Base URL / API Key / Model ID 与 SSE 流式输出）
+- [ ] 实现内置托管 **`llama-server` (`llama.cpp` CUDA) Sidecar 管理器**：
+  - [ ] 首次启用本地 GGUF 时自动下载 `llama-server` 运行时至 `%LocalAppData%\com.bigbiglv.skippy\runtime\`（不绑死重型外部服务）
+  - [ ] 实现按需启动、健康检查、Idle TTL 超时强杀回收 100% 显存
+- [ ] 可选兼容本机已有 **Ollama**（自动探测 `127.0.0.1:11434`，支持 `/api/tags` 复用已有模型与 `keep_alive` 卸载）
 - [ ] 完善 `App.vue`：Markdown 渲染、流式打字机效果、停止生成、会话自动命名
-- [ ] 完善 `ModelHubModal.vue`：模型下载器（带进度条与镜像源切换）、本地文件校验与删除
+- [ ] 完善 `ModelHubModal.vue`：GGUF 模型下载器（带进度条与镜像源切换）、本地文件校验与删除
 
 ### Step 3：语音唤醒、识别与播报闭环
 - [ ] 音频采集模块（`cpal` WASAPI 事件驱动 + 无锁 SPSC 环形缓冲）
@@ -38,10 +41,11 @@
   - [ ] 接入 `Edge-TTS`（在线免部署）、`Windows WinRT TTS`（离线兜底）、`Kokoro-82M`（CPU ONNX 离线）
 - [ ] 对话历史记录自动写入语音来源 (`pc_voice`) 并实时同步到已打开的 GUI
 
-### Step 4：按需预热与主力机 GPU Worker 集成（换主力机补全环境后联调）
-- [ ] 在主力机安装 `Ollama` 与 `Python 3.11+`
-- [ ] 实现“唤醒瞬间并发预热”（录音同时异步唤醒 Ollama / Worker）
-- [ ] 实现空闲超时回收器（Idle TTL -> `Ollama keep_alive: 0` + 终止 Python Worker）
+### Step 4：按需预热与主力机 GPU Worker 集成（换主力机后联调）
+- [ ] 在主力机测试内置 `llama-server` CUDA 推理与 5070 12GB 显存空闲强杀回收
+- [ ] 在主力机按需安装 `Python 3.11+`（仅重型 GPU 语音与二期视觉兜底需要）
+- [ ] 实现“唤醒瞬间并发预热”（录音同时异步拉起 `llama-server` / Python Worker）
+- [ ] 实现空闲超时回收器（Idle TTL -> 终止 `llama-server` / Python Worker，Ollama 发送 `keep_alive: 0`）
 - [ ] 完成 `worker/` 目录按需 Python Worker（支持 `Qwen3-ASR`、`CosyVoice` / `Index-TTS` 声音克隆）
 - [ ] 实测收起 GUI 后的常驻内存（目标 < 80MB）与待机显存占用（目标 0MB）
 
