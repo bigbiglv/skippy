@@ -36,8 +36,17 @@ const status = ref<RuntimeStatus>({
   stage_label: "初始化中...",
   ollama_connected: false,
   python_worker_running: false,
+  python_env: {
+    python_available: false,
+    python_version: null,
+    python_path: null,
+    venv_ready: false,
+    worker_script_found: false,
+  },
   gpu_vram_active_mb: 0,
 });
+const workerBusy = ref(false);
+const workerError = ref("");
 const sessions = ref<ChatSession[]>([]);
 const activeSessionId = ref<string>("");
 const messages = ref<ChatMessage[]>([]);
@@ -136,6 +145,32 @@ async function handleUpdateSetting(key: string, value: string) {
     key,
     value,
   });
+}
+
+async function handleStartWorker() {
+  workerBusy.value = true;
+  workerError.value = "";
+  try {
+    await invoke("start_python_worker");
+    const snap = await invoke<AppSnapshot>("get_app_snapshot");
+    status.value = snap.status;
+  } catch (err) {
+    workerError.value = String(err);
+  } finally {
+    workerBusy.value = false;
+  }
+}
+
+async function handleStopWorker() {
+  workerBusy.value = true;
+  workerError.value = "";
+  try {
+    status.value = await invoke<RuntimeStatus>("stop_python_worker");
+  } catch (err) {
+    workerError.value = String(err);
+  } finally {
+    workerBusy.value = false;
+  }
 }
 
 function sourceLabel(source: ChatMessage["source"]): string {
@@ -319,8 +354,13 @@ onMounted(() => {
       :models="models"
       :ollama-connected="status.ollama_connected"
       :python-running="status.python_worker_running"
+      :python-env="status.python_env"
+      :worker-busy="workerBusy"
+      :worker-error="workerError"
       @close="modelHubOpen = false"
       @select="handleSelectModel"
+      @start-worker="handleStartWorker"
+      @stop-worker="handleStopWorker"
     />
 
     <SettingsModal

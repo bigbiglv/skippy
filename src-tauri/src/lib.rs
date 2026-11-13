@@ -2,14 +2,18 @@ mod commands;
 mod models;
 mod state;
 mod storage;
+mod worker;
 
 use state::{AppState, RuntimeStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
+use storage::chat_repo::get_all_settings;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use worker::supervisor::WorkerSupervisor;
 
 pub fn show_or_recreate_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -37,7 +41,6 @@ pub fn show_or_recreate_main_window(app: &AppHandle) {
 pub fn toggle_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_focused().unwrap_or(false) {
-            // 直接销毁 WebView 释放渲染内存，保持 Rust 托盘常驻
             let _ = window.destroy();
             return;
         }
@@ -60,14 +63,58 @@ pub fn run() {
             let db_path = data_dir.join("skippy.db");
             let conn = storage::init_db(&db_path).expect("failed to initialize sqlite db");
 
+            let worker = WorkerSupervisor::new(18765);
+            let python_env = worker.detect_env();
+
             app.manage(AppState {
                 db: Mutex::new(conn),
                 data_dir,
-                status: Mutex::new(RuntimeStatus::default()),
+                status: Mutex::new(RuntimeStatus::with_env(python_env)),
+                worker: Mutex::new(worker),
                 should_exit: AtomicBool::new(false),
             });
 
-            // 注册系统托盘（GUI 关闭销毁后由此常驻唤醒）
+            // 后台空闲超时回收循环（Idle TTL）：自动终止闲置的按需 Worker 释放内存与显存
+            let reaper_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    let state = reaper_handle.state::<AppState>();
+
+                    let ttl_secs: u64 = state
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|db| get_all_settings(&db).ok())
+                        .and_then(|s| s.get("idle_unload_secs").cloned())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(180);
+
+                    if ttl_secs == 0 {
+                        continue;
+                    }
+
+                    let stopped = if let Ok(mut w) = state.worker.lock() {
+                        if w.is_running()
+                            && w.idle_elapsed_secs().is_some_and(|elapsed| elapsed >= ttl_secs)
+                        {
+                            w.stop()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if stopped {
+                        if let Ok(mut st) = state.status.lock() {
+                            st.python_worker_running = false;
+                            st.gpu_vram_active_mb = 0;
+                        }
+                    }
+                }
+            });
+
             let open_item = MenuItem::with_id(app, "open", "打开 Skippy", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出 Skippy", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&open_item, &quit_item])?;
@@ -80,6 +127,9 @@ pub fn run() {
                     "open" => show_or_recreate_main_window(app),
                     "quit" => {
                         let state = app.state::<AppState>();
+                        if let Ok(mut w) = state.worker.lock() {
+                            w.stop();
+                        }
                         state.should_exit.store(true, Ordering::Relaxed);
                         app.exit(0);
                     }
@@ -101,7 +151,6 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
-            // 注册全局快捷键 Alt + Space
             let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
             app.handle().plugin(
                 tauri_plugin_global_shortcut::Builder::new()
@@ -127,6 +176,8 @@ pub fn run() {
             commands::send_text_message,
             commands::select_active_model,
             commands::update_app_setting,
+            commands::start_python_worker,
+            commands::stop_python_worker,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -136,7 +187,6 @@ pub fn run() {
             if code.is_none() {
                 let state = app_handle.state::<AppState>();
                 if !state.should_exit.load(Ordering::Relaxed) {
-                    // 最后一个窗口被关闭（WebView 已销毁），阻止进程退出以维持低内存托盘常驻
                     api.prevent_exit();
                 }
             }

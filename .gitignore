@@ -26,6 +26,9 @@ src-tauri/gen/schemas
 *.gguf
 *.safetensors
 /models/
+worker/.venv/
+**/__pycache__/
+*.pyc
 .env
 .env.*
 

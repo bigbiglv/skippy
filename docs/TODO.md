@@ -41,12 +41,11 @@
   - [ ] 接入 `Edge-TTS`（在线免部署）、`Windows WinRT TTS`（离线兜底）、`Kokoro-82M`（CPU ONNX 离线）
 - [ ] 对话历史记录自动写入语音来源 (`pc_voice`) 并实时同步到已打开的 GUI
 
-### Step 4：按需预热与主力机 GPU Worker 集成（换主力机后联调）
-- [ ] 在主力机测试内置 `llama-server` CUDA 推理与 5070 12GB 显存空闲强杀回收
-- [ ] 在主力机按需安装 `Python 3.11+`（仅重型 GPU 语音与二期视觉兜底需要）
-- [ ] 实现“唤醒瞬间并发预热”（录音同时异步拉起 `llama-server` / Python Worker）
-- [ ] 实现空闲超时回收器（Idle TTL -> 终止 `llama-server` / Python Worker，Ollama 发送 `keep_alive: 0`）
-- [ ] 完成 `worker/` 目录按需 Python Worker（支持 `Qwen3-ASR`、`CosyVoice` / `Index-TTS` 声音克隆）
+### Step 4：按需预热与 GPU Worker 深度推理集成
+- [x] 通过 `mise` 安装 Python 3.12 (`worker/.venv`) 并搭建按需 FastAPI AI Worker 服务骨架 (`worker/server.py`)
+- [x] 实现 Rust `WorkerSupervisor` 按需拉起（无黑框）、健康检查与 Idle TTL 自动杀进程回收显存
+- [ ] 在 `worker/requirements-gpu.txt` 安装 PyTorch CUDA 12.8+ 并下载 `Qwen3-ASR` 与 `CosyVoice` / `Index-TTS` 权重实现真实推理
+- [ ] 实现内置 `llama-server` CUDA 推理与 5070 12GB 显存按需预热 + 空闲强杀回收
 - [ ] 实测收起 GUI 后的常驻内存（目标 < 80MB）与待机显存占用（目标 0MB）
 
 ---

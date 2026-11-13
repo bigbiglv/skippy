@@ -4,6 +4,7 @@ use crate::storage::chat_repo::{
     append_message, create_session, delete_session, get_all_settings, list_messages,
     list_sessions, set_setting, ChatMessage, ChatSession,
 };
+use crate::worker::supervisor::{wait_for_health, WorkerHealth};
 use serde::Serialize;
 use std::collections::HashMap;
 use tauri::State;
@@ -23,9 +24,19 @@ pub fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, Strin
     let sessions = list_sessions(&db).map_err(|e| e.to_string())?;
     let models = list_catalog_with_state(&db).map_err(|e| e.to_string())?;
     let settings = get_all_settings(&db).map_err(|e| e.to_string())?;
-    let status = state.status.lock().map_err(|e| e.to_string())?.clone();
+
+    let (worker_running, python_env) = {
+        let mut worker = state.worker.lock().map_err(|e| e.to_string())?;
+        (worker.is_running(), worker.detect_env())
+    };
+
+    let mut status = state.status.lock().map_err(|e| e.to_string())?;
+    status.python_worker_running = worker_running;
+    status.python_env = python_env;
+    let status_clone = status.clone();
+
     Ok(AppSnapshot {
-        status,
+        status: status_clone,
         sessions,
         models,
         settings,
@@ -80,7 +91,6 @@ pub fn send_text_message(
     let user_message = append_message(&db, &session_id, "user", "pc_text", &content, None)
         .map_err(|e| e.to_string())?;
 
-    // Step 1 骨架占位回复：Step 2 将替换为真实 Ollama / OpenAI-compatible SSE 流式推理
     let reply = format!(
         "已收到你的消息：「{}」\n\n当前为 Step 1 底座验证模式（已持久化至 SQLite）。Step 2 将接入 `{}` 进行流式对话响应。",
         content, active_llm
@@ -133,4 +143,39 @@ pub fn update_app_setting(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     set_setting(&db, &key, &value).map_err(|e| e.to_string())?;
     get_all_settings(&db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn start_python_worker(state: State<'_, AppState>) -> Result<WorkerHealth, String> {
+    let base_url = {
+        let mut worker = state.worker.lock().map_err(|e| e.to_string())?;
+        worker.spawn_if_needed()?
+    };
+
+    let health = match wait_for_health(&base_url).await {
+        Ok(h) => h,
+        Err(e) => {
+            if let Ok(mut worker) = state.worker.lock() {
+                worker.stop();
+            }
+            return Err(e);
+        }
+    };
+
+    let mut status = state.status.lock().map_err(|e| e.to_string())?;
+    status.python_worker_running = true;
+    status.gpu_vram_active_mb = health.gpu.vram_used_mb;
+    Ok(health)
+}
+
+#[tauri::command]
+pub fn stop_python_worker(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+    {
+        let mut worker = state.worker.lock().map_err(|e| e.to_string())?;
+        worker.stop();
+    }
+    let mut status = state.status.lock().map_err(|e| e.to_string())?;
+    status.python_worker_running = false;
+    status.gpu_vram_active_mb = 0;
+    Ok(status.clone())
 }

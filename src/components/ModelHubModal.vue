@@ -1,18 +1,33 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Check, Cpu, Cloud, HardDrive, Sparkles, X, AlertTriangle } from "lucide-vue-next";
-import type { ModelCatalogItem, ModelCategory } from "../types/skippy";
+import {
+  AlertTriangle,
+  Check,
+  Cloud,
+  Cpu,
+  HardDrive,
+  Play,
+  Sparkles,
+  Square,
+  X,
+} from "lucide-vue-next";
+import type { ModelCatalogItem, ModelCategory, PythonEnvInfo } from "../types/skippy";
 
 const props = defineProps<{
   open: boolean;
   models: ModelCatalogItem[];
   ollamaConnected: boolean;
   pythonRunning: boolean;
+  pythonEnv: PythonEnvInfo;
+  workerBusy: boolean;
+  workerError: string;
 }>();
 
 const emit = defineEmits<{
   (e: "close"): void;
   (e: "select", category: ModelCategory, modelId: string): void;
+  (e: "start-worker"): void;
+  (e: "stop-worker"): void;
 }>();
 
 const activeTab = ref<ModelCategory>("llm");
@@ -156,10 +171,16 @@ function formatDisk(mb: number): string {
                 <AlertTriangle class="h-3 w-3" /> 未检测到本机 Ollama（Step 2 接入检测）
               </span>
               <span
-                v-if="item.requires_python && !pythonRunning"
+                v-if="item.requires_python && !pythonEnv.venv_ready"
                 class="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400"
               >
-                <AlertTriangle class="h-3 w-3" /> 需主力机 Python Worker
+                <AlertTriangle class="h-3 w-3" /> 需要配置 worker/.venv
+              </span>
+              <span
+                v-else-if="item.requires_python && pythonEnv.venv_ready && !pythonRunning"
+                class="inline-flex items-center gap-1 text-zinc-500 dark:text-zinc-400"
+              >
+                Python 已就绪（待机休眠中，调用时自动拉起）
               </span>
             </div>
           </div>
@@ -181,33 +202,74 @@ function formatDisk(mb: number): string {
         </div>
       </div>
 
-      <!-- Footer VRAM Estimator -->
-      <div class="border-t border-zinc-200 bg-zinc-50/80 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
-        <div class="flex items-center justify-between text-xs">
-          <span class="font-medium text-zinc-700 dark:text-zinc-300">
-            唤醒后预计峰值显存（RTX 5070 · 12 GB 上限）
-          </span>
-          <span
-            class="font-semibold"
-            :class="{
-              'text-emerald-600 dark:text-emerald-400': vramLevel === 'ok',
-              'text-amber-600 dark:text-amber-400': vramLevel === 'warn',
-              'text-red-600 dark:text-red-400': vramLevel === 'danger',
-            }"
-          >
-            {{ (totalEstVramMb / 1024).toFixed(1) }} / 12.0 GB ({{ vramPercent }}%)
-          </span>
+      <!-- Footer VRAM Estimator & Worker Status -->
+      <div class="space-y-3 border-t border-zinc-200 bg-zinc-50/80 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+        <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+          <div class="flex items-center gap-2">
+            <span
+              class="h-2 w-2 rounded-full"
+              :class="pythonRunning ? 'bg-emerald-500' : pythonEnv.venv_ready ? 'bg-zinc-400' : 'bg-amber-500'"
+            />
+            <span class="font-medium text-zinc-800 dark:text-zinc-200">
+              按需 Python AI Worker：
+              <template v-if="pythonRunning">运行中（空闲自动回收）</template>
+              <template v-else-if="pythonEnv.venv_ready">
+                待机休眠 · {{ pythonEnv.python_version || "Python" }} 已就绪
+              </template>
+              <template v-else>未检测到 worker/.venv</template>
+            </span>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <button
+              v-if="!pythonRunning"
+              :disabled="workerBusy || !pythonEnv.venv_ready"
+              class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+              @click="emit('start-worker')"
+            >
+              <Play class="h-3 w-3" />
+              {{ workerBusy ? "启动中..." : "预热启动" }}
+            </button>
+            <button
+              v-else
+              :disabled="workerBusy"
+              class="inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50 px-2.5 py-1 text-[11px] font-medium text-red-700 hover:bg-red-100 disabled:opacity-40 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300"
+              @click="emit('stop-worker')"
+            >
+              <Square class="h-3 w-3" />
+              {{ workerBusy ? "释放中..." : "立即释放" }}
+            </button>
+          </div>
         </div>
-        <div class="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
-          <div
-            class="h-full rounded-full transition-all duration-300"
-            :class="{
-              'bg-emerald-500': vramLevel === 'ok',
-              'bg-amber-500': vramLevel === 'warn',
-              'bg-red-500': vramLevel === 'danger',
-            }"
-            :style="{ width: `${vramPercent}%` }"
-          />
+        <p v-if="workerError" class="text-[11px] text-red-600 dark:text-red-400">{{ workerError }}</p>
+
+        <div>
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-medium text-zinc-700 dark:text-zinc-300">
+              唤醒后预计峰值显存（RTX 5070 · 12 GB 上限）
+            </span>
+            <span
+              class="font-semibold"
+              :class="{
+                'text-emerald-600 dark:text-emerald-400': vramLevel === 'ok',
+                'text-amber-600 dark:text-amber-400': vramLevel === 'warn',
+                'text-red-600 dark:text-red-400': vramLevel === 'danger',
+              }"
+            >
+              {{ (totalEstVramMb / 1024).toFixed(1) }} / 12.0 GB ({{ vramPercent }}%)
+            </span>
+          </div>
+          <div class="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+            <div
+              class="h-full rounded-full transition-all duration-300"
+              :class="{
+                'bg-emerald-500': vramLevel === 'ok',
+                'bg-amber-500': vramLevel === 'warn',
+                'bg-red-500': vramLevel === 'danger',
+              }"
+              :style="{ width: `${vramPercent}%` }"
+            />
+          </div>
         </div>
       </div>
     </div>

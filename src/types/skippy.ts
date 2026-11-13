@@ -6,11 +6,20 @@ export type VoiceStage =
   | "speaking"
   | "sleeping";
 
+export interface PythonEnvInfo {
+  python_available: boolean;
+  python_version: string | null;
+  python_path: string | null;
+  venv_ready: boolean;
+  worker_script_found: boolean;
+}
+
 export interface RuntimeStatus {
   stage: VoiceStage;
   stage_label: string;
   ollama_connected: boolean;
   python_worker_running: boolean;
+  python_env: PythonEnvInfo;
   gpu_vram_active_mb: number;
 }
 
