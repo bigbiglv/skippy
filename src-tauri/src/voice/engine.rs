@@ -100,8 +100,9 @@ fn read_runtime_bundle(app: &AppHandle) -> Option<RuntimeBundle> {
         .unwrap_or_else(|| "sensevoice-small-int8".to_string());
     let wake_word = settings
         .get("wake_word")
-        .cloned()
-        .unwrap_or_else(|| "Skippy".to_string());
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "密探阿泰".to_string());
 
     Some(RuntimeBundle {
         storage_dir,

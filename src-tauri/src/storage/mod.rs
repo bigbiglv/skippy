@@ -68,7 +68,7 @@ fn seed_defaults(conn: &Connection, data_dir: Option<&Path>) -> Result<()> {
     let default_settings = [
         ("theme", "system"),
         ("wake_mode", "shortcut"),
-        ("wake_word", "Skippy"),
+        ("wake_word", "密探阿泰"),
         ("shortcut", "Alt+Space"),
         ("idle_unload_secs", "180"),
         ("audio_ducking", "true"),
@@ -178,6 +178,33 @@ fn seed_defaults(conn: &Connection, data_dir: Option<&Path>) -> Result<()> {
         }
         conn.execute(
             "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('migrated_local_tts_v1', '1')",
+            [],
+        )?;
+    }
+
+    let wake_migrated: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'migrated_wake_word_atai_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if wake_migrated.is_none() {
+        let current_wake: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'wake_word'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        if current_wake.trim().is_empty() || current_wake.trim().eq_ignore_ascii_case("skippy") {
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('wake_word', '密探阿泰')",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('migrated_wake_word_atai_v1', '1')",
             [],
         )?;
     }

@@ -1,5 +1,5 @@
 use crate::voice::assets::{
-    find_asr_paths, find_kws_paths, find_voice_asset_spec, is_voice_model_installed,
+    find_asr_paths, find_voice_asset_spec, is_voice_model_installed, kws_model_dir,
 };
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
@@ -107,7 +107,7 @@ const CATALOG: &[BuiltinDef] = &[
         compute: "cpu",
         est_vram_mb: 0,
         disk_size_mb: 12,
-        description: "支持中文/中英混合自定义唤醒词（如 Skippy），常驻 CPU 约 1%。",
+        description: "支持中文/中英混合自定义唤醒词（如 密探阿泰），常驻 CPU 约 1%。",
         tags: &["推荐", "纯Rust", "中英唤醒"],
         requires_python: false,
         requires_ollama: false,
@@ -375,8 +375,7 @@ pub fn list_catalog_with_state(conn: &Connection, storage_dir: &Path) -> Result<
                 let installed = is_voice_model_installed(storage_dir, def.id);
                 let resolved_path = if installed {
                     if def.category == "kws" {
-                        find_kws_paths(storage_dir, "Skippy")
-                            .map(|p| p.root.to_string_lossy().to_string())
+                        kws_model_dir(storage_dir).map(|p| p.to_string_lossy().to_string())
                     } else {
                         find_asr_paths(storage_dir, def.id)
                             .and_then(|p| p.model_onnx.parent().map(|d| d.to_string_lossy().to_string()))

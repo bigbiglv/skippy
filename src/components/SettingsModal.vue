@@ -90,8 +90,8 @@ const emit = defineEmits<{
             <label class="block text-xs font-semibold text-zinc-700 dark:text-zinc-300">语音唤醒词</label>
             <input
               type="text"
-              :value="settings.wake_word || 'Skippy'"
-              placeholder="Skippy"
+              :value="settings.wake_word || '密探阿泰'"
+              placeholder="密探阿泰"
               class="mt-2 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
               @change="emit('update', 'wake_word', ($event.target as HTMLInputElement).value)"
             />

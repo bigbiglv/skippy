@@ -1,4 +1,5 @@
 use crate::llm::downloader::{download_file_with_progress, emit_download_progress, DownloadProgressEvent};
+use pinyin::ToPinyin;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,12 +70,26 @@ pub fn find_sherpa_c_api_dll(storage_dir: &Path) -> Option<PathBuf> {
 }
 
 pub struct KwsModelPaths {
-    pub root: PathBuf,
     pub encoder: PathBuf,
     pub decoder: PathBuf,
     pub joiner: PathBuf,
     pub tokens: PathBuf,
     pub keywords_file: PathBuf,
+}
+
+pub fn has_kws_model_files(storage_dir: &Path) -> bool {
+    let dir = voice_models_root(storage_dir).join("kws-zh-en");
+    if !dir.exists() {
+        return false;
+    }
+    find_file_recursive(&dir, 2, |n| n.starts_with("encoder") && n.ends_with(".onnx")).is_some()
+        && find_file_recursive(&dir, 2, |n| n.starts_with("decoder") && n.ends_with(".onnx")).is_some()
+        && find_file_recursive(&dir, 2, |n| n.starts_with("joiner") && n.ends_with(".onnx")).is_some()
+        && find_file_recursive(&dir, 2, |n| n == "tokens.txt").is_some()
+}
+
+pub fn kws_model_dir(storage_dir: &Path) -> Option<PathBuf> {
+    has_kws_model_files(storage_dir).then(|| voice_models_root(storage_dir).join("kws-zh-en"))
 }
 
 pub fn find_kws_paths(storage_dir: &Path, wake_word: &str) -> Option<KwsModelPaths> {
@@ -87,11 +102,17 @@ pub fn find_kws_paths(storage_dir: &Path, wake_word: &str) -> Option<KwsModelPat
     let decoder = find_file_recursive(&dir, 2, |n| n.starts_with("decoder") && n.ends_with(".onnx"))?;
     let joiner = find_file_recursive(&dir, 2, |n| n.starts_with("joiner") && n.ends_with(".onnx"))?;
     let tokens = find_file_recursive(&dir, 2, |n| n == "tokens.txt")?;
+    let en_phone = find_file_recursive(&dir, 2, |n| n == "en.phone");
     let base_kw = find_file_recursive(&dir, 2, |n| n == "keywords.txt");
-    let keywords_file = prepare_keywords_file(&dir, &tokens, base_kw.as_deref(), wake_word);
+    let keywords_file = prepare_keywords_file(
+        &dir,
+        &tokens,
+        en_phone.as_deref(),
+        base_kw.as_deref(),
+        wake_word,
+    );
 
     Some(KwsModelPaths {
-        root: dir,
         encoder,
         decoder,
         joiner,
@@ -127,7 +148,7 @@ pub fn find_asr_paths(storage_dir: &Path, model_id: &str) -> Option<AsrModelPath
 
 pub fn is_voice_model_installed(storage_dir: &Path, model_id: &str) -> bool {
     match model_id {
-        "sherpa-kws-zh-en" => find_kws_paths(storage_dir, "Skippy").is_some(),
+        "sherpa-kws-zh-en" => has_kws_model_files(storage_dir),
         "sensevoice-small-int8" => find_asr_paths(storage_dir, "sensevoice-small-int8").is_some(),
         "paraformer-zh-streaming" => find_asr_paths(storage_dir, "paraformer-zh-streaming").is_some(),
         _ => false,
@@ -137,6 +158,7 @@ pub fn is_voice_model_installed(storage_dir: &Path, model_id: &str) -> bool {
 fn prepare_keywords_file(
     model_dir: &Path,
     tokens_path: &Path,
+    en_phone_path: Option<&Path>,
     bundled_kw: Option<&Path>,
     wake_word: &str,
 ) -> PathBuf {
@@ -149,26 +171,44 @@ fn prepare_keywords_file(
         .collect();
 
     let mut lines: Vec<String> = Vec::new();
-    let trimmed = wake_word.trim();
-    if !trimmed.is_empty() {
-        if let Some(tokenized) = tokenize_english_word_for_bpe(trimmed, &token_set) {
+    for part in wake_word.split([',', '，', ';', '；', '\n']) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((raw_tokens, label)) = trimmed.split_once('@') {
+            let toks: Vec<&str> = raw_tokens.split_whitespace().collect();
+            if !toks.is_empty() && toks.iter().all(|t| token_set.contains(*t)) {
+                let display = label.trim();
+                let formatted = if display.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    format!("{} @{}", toks.join(" "), display)
+                };
+                lines.push(formatted);
+                continue;
+            }
+        }
+
+        if let Some(tokenized) = tokenize_wake_phrase(trimmed, &token_set, en_phone_path) {
             lines.push(format!("{tokenized} @{trimmed}"));
         }
     }
 
-    if let Some(base) = bundled_kw {
-        if let Ok(raw) = fs::read_to_string(base) {
-            for l in raw.lines() {
-                let t = l.trim();
-                if !t.is_empty() && lines.len() < 8 {
-                    lines.push(t.to_string());
+    if lines.is_empty() {
+        if let Some(base) = bundled_kw {
+            if let Ok(raw) = fs::read_to_string(base) {
+                for l in raw.lines() {
+                    let t = l.trim();
+                    if !t.is_empty() && lines.len() < 8 {
+                        lines.push(t.to_string());
+                    }
                 }
             }
         }
     }
 
-    if let Some(first_fallback) = lines.first().cloned() {
-        let _ = &first_fallback;
+    if !lines.is_empty() {
         let _ = fs::write(&custom_path, lines.join("\n"));
         return custom_path;
     }
@@ -176,6 +216,108 @@ fn prepare_keywords_file(
     bundled_kw
         .map(|p| p.to_path_buf())
         .unwrap_or(custom_path)
+}
+
+fn tokenize_wake_phrase(
+    phrase: &str,
+    token_set: &HashSet<String>,
+    en_phone_path: Option<&Path>,
+) -> Option<String> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut ascii_buf = String::new();
+
+    let flush_ascii = |buf: &mut String, out: &mut Vec<String>| -> bool {
+        if buf.is_empty() {
+            return true;
+        }
+        let word = std::mem::take(buf);
+        if let Some(phones) = lookup_en_phone_word(&word, en_phone_path, token_set) {
+            out.extend(phones);
+            return true;
+        }
+        if let Some(bpe) = tokenize_english_word_for_bpe(&word, token_set) {
+            out.extend(bpe.split_whitespace().map(|s| s.to_string()));
+            return true;
+        }
+        false
+    };
+
+    for ch in phrase.chars() {
+        if ch.is_ascii_alphabetic() || ch == '\'' {
+            ascii_buf.push(ch);
+            continue;
+        }
+
+        if !flush_ascii(&mut ascii_buf, &mut pieces) {
+            return None;
+        }
+
+        if ch.is_whitespace() {
+            continue;
+        }
+
+        if let Some(py) = ch.to_pinyin() {
+            let syl = py.with_tone();
+            let toks = split_pinyin_syllable(syl, token_set)?;
+            pieces.extend(toks);
+        } else {
+            return None;
+        }
+    }
+
+    if !flush_ascii(&mut ascii_buf, &mut pieces) {
+        return None;
+    }
+
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(pieces.join(" "))
+    }
+}
+
+fn split_pinyin_syllable(syllable: &str, token_set: &HashSet<String>) -> Option<Vec<String>> {
+    const INITIALS: &[&str] = &[
+        "zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x",
+        "r", "z", "c", "s", "y", "w",
+    ];
+    let norm = syllable.trim().to_lowercase().replace('v', "ü");
+
+    for init in INITIALS {
+        if let Some(rest) = norm.strip_prefix(init) {
+            if !rest.is_empty() && token_set.contains(*init) && token_set.contains(rest) {
+                return Some(vec![(*init).to_string(), rest.to_string()]);
+            }
+        }
+    }
+
+    if token_set.contains(&norm) {
+        return Some(vec![norm]);
+    }
+    None
+}
+
+fn lookup_en_phone_word(
+    word: &str,
+    en_phone_path: Option<&Path>,
+    token_set: &HashSet<String>,
+) -> Option<Vec<String>> {
+    let path = en_phone_path?;
+    let raw = fs::read_to_string(path).ok()?;
+    let target = word.to_ascii_uppercase();
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(head) = parts.next() else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(&target) {
+            let phones: Vec<String> = parts.map(|p| p.to_string()).collect();
+            if !phones.is_empty() && phones.iter().all(|p| token_set.contains(p)) {
+                return Some(phones);
+            }
+        }
+    }
+    None
 }
 
 fn tokenize_english_word_for_bpe(word: &str, token_set: &HashSet<String>) -> Option<String> {
@@ -409,4 +551,20 @@ pub async fn download_voice_model(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenizes_mi_tan_a_tai_with_zh_en_tokens() {
+        let mut tokens: HashSet<String> = HashSet::new();
+        for tok in ["m", "ì", "t", "àn", "ā", "ē", "ài"] {
+            tokens.insert(tok.to_string());
+        }
+        let encoded = tokenize_wake_phrase("密探阿泰", &tokens, None)
+            .expect("should tokenize 密探阿泰 into sherpa KWS tokens");
+        assert_eq!(encoded, "m ì t àn ā t ài");
+    }
 }

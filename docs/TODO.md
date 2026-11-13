@@ -29,7 +29,7 @@
 ### Step 3：语音唤醒、识别与播报闭环（纯本地引擎已接入，待实机安装套件联调）
 - [x] 音频采集模块（`cpal` WASAPI 采集 + 重采样 16kHz + 预缓冲环形队列，`shortcut-only` 模式自动释放麦克风）
 - [x] 接入 `sherpa-onnx`（Rust 动态绑定 `sherpa-onnx-c-api.dll` + 一键安装包下载到 D 盘）：
-  - [x] 本地唤醒词检测（KWS Zipformer，`默认 "Skippy"`，支持切换为“仅快捷键模式”）
+  - [x] 本地唤醒词检测（KWS Zipformer，默认 `"密探阿泰"`，支持自定义或切换为“仅快捷键模式”）
   - [x] Silero VAD 语音端点检测（含能量门限兜底）
   - [ ] 可选声纹过滤（防止电脑外放视频/音乐误触发）
   - [x] 本地 CPU 离线识别（`SenseVoice-Small INT8` / `Paraformer-zh`）
