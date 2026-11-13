@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCatalogItem {
@@ -17,6 +18,53 @@ pub struct ModelCatalogItem {
     pub requires_ollama: bool,
     pub is_active: bool,
     pub is_installed: bool,
+    pub local_path: Option<String>,
+    pub downloadable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GgufDownloadSpec {
+    pub model_id: &'static str,
+    pub repo: &'static str,
+    pub filename: &'static str,
+}
+
+const GGUF_SPECS: &[GgufDownloadSpec] = &[
+    GgufDownloadSpec {
+        model_id: "llama-qwen3-4b-gguf",
+        repo: "Qwen/Qwen3-4B-GGUF",
+        filename: "Qwen3-4B-Q4_K_M.gguf",
+    },
+    GgufDownloadSpec {
+        model_id: "llama-qwen3-8b-gguf",
+        repo: "Qwen/Qwen3-8B-GGUF",
+        filename: "Qwen3-8B-Q4_K_M.gguf",
+    },
+];
+
+pub fn find_gguf_spec(model_id: &str) -> Option<&'static GgufDownloadSpec> {
+    GGUF_SPECS.iter().find(|s| s.model_id == model_id)
+}
+
+pub fn gguf_download_url(spec: &GgufDownloadSpec, mirror: &str) -> String {
+    match mirror {
+        "hf-mirror" => format!(
+            "https://hf-mirror.com/{}/resolve/main/{}",
+            spec.repo, spec.filename
+        ),
+        "huggingface" => format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            spec.repo, spec.filename
+        ),
+        _ => format!(
+            "https://modelscope.cn/models/{}/resolve/master/{}",
+            spec.repo, spec.filename
+        ),
+    }
+}
+
+pub fn default_gguf_path(storage_dir: &Path, filename: &str) -> PathBuf {
+    storage_dir.join("models").join("gguf").join(filename)
 }
 
 struct BuiltinDef {
@@ -248,9 +296,40 @@ const CATALOG: &[BuiltinDef] = &[
     },
 ];
 
-pub fn list_catalog_with_state(conn: &Connection) -> Result<Vec<ModelCatalogItem>> {
+pub fn resolve_model_gguf_path(
+    conn: &Connection,
+    storage_dir: &Path,
+    model_id: &str,
+) -> Option<PathBuf> {
+    let db_path: Option<String> = conn
+        .query_row(
+            "SELECT local_path FROM model_configs WHERE category = 'llm' AND model_id = ?1",
+            params![model_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    if let Some(p) = db_path {
+        let candidate = PathBuf::from(&p);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(spec) = find_gguf_spec(model_id) {
+        let default_path = default_gguf_path(storage_dir, spec.filename);
+        if default_path.exists() {
+            return Some(default_path);
+        }
+    }
+
+    None
+}
+
+pub fn list_catalog_with_state(conn: &Connection, storage_dir: &Path) -> Result<Vec<ModelCatalogItem>> {
     let mut stmt = conn.prepare(
-        "SELECT category, model_id, is_active, is_installed FROM model_configs",
+        "SELECT category, model_id, is_active, is_installed, local_path FROM model_configs",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -258,22 +337,40 @@ pub fn list_catalog_with_state(conn: &Connection) -> Result<Vec<ModelCatalogItem
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)? != 0,
             row.get::<_, i64>(3)? != 0,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
 
-    let mut state_map: HashMap<(String, String), (bool, bool)> = HashMap::new();
+    let mut state_map: HashMap<(String, String), (bool, bool, Option<String>)> = HashMap::new();
     for r in rows {
-        let (cat, id, active, installed) = r?;
-        state_map.insert((cat, id), (active, installed));
+        let (cat, id, active, installed, local_path) = r?;
+        state_map.insert((cat, id), (active, installed, local_path));
     }
 
     let items = CATALOG
         .iter()
         .map(|def| {
-            let (is_active, is_installed) = state_map
+            let (is_active, db_installed, db_path) = state_map
                 .get(&(def.category.to_string(), def.id.to_string()))
-                .copied()
-                .unwrap_or((false, false));
+                .cloned()
+                .unwrap_or((false, false, None));
+
+            let spec = find_gguf_spec(def.id);
+            let downloadable = spec.is_some();
+
+            let (is_installed, local_path) = if def.engine == "llama-server" {
+                let valid_db = db_path.as_ref().filter(|p| Path::new(p).exists()).cloned();
+                let disk_default = spec
+                    .map(|s| default_gguf_path(storage_dir, s.filename))
+                    .filter(|p| p.exists())
+                    .map(|p| p.to_string_lossy().to_string());
+
+                let resolved = valid_db.or(disk_default);
+                (resolved.is_some(), resolved)
+            } else {
+                (db_installed, db_path)
+            };
+
             ModelCatalogItem {
                 id: def.id.to_string(),
                 category: def.category.to_string(),
@@ -288,6 +385,8 @@ pub fn list_catalog_with_state(conn: &Connection) -> Result<Vec<ModelCatalogItem
                 requires_ollama: def.requires_ollama,
                 is_active,
                 is_installed,
+                local_path,
+                downloadable,
             }
         })
         .collect();
@@ -305,6 +404,25 @@ pub fn set_active_model(conn: &Connection, category: &str, model_id: &str) -> Re
          VALUES (?1, ?2, 1, 0)
          ON CONFLICT(category, model_id) DO UPDATE SET is_active = 1",
         params![category, model_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_model_local_path(
+    conn: &Connection,
+    category: &str,
+    model_id: &str,
+    local_path: Option<&str>,
+    is_installed: bool,
+) -> Result<()> {
+    let installed_int = if is_installed { 1 } else { 0 };
+    conn.execute(
+        "INSERT INTO model_configs (category, model_id, is_active, is_installed, local_path)
+         VALUES (?1, ?2, 0, ?3, ?4)
+         ON CONFLICT(category, model_id) DO UPDATE SET
+            is_installed = excluded.is_installed,
+            local_path = excluded.local_path",
+        params![category, model_id, installed_int, local_path],
     )?;
     Ok(())
 }

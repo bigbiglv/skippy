@@ -18,8 +18,13 @@ export interface RuntimeStatus {
   stage: VoiceStage;
   stage_label: string;
   ollama_connected: boolean;
+  ollama_models: string[];
   python_worker_running: boolean;
   python_env: PythonEnvInfo;
+  llama_runtime_ready: boolean;
+  llama_server_running: boolean;
+  llama_loaded_model: string | null;
+  local_storage_dir: string;
   gpu_vram_active_mb: number;
 }
 
@@ -57,6 +62,8 @@ export interface ModelCatalogItem {
   requires_ollama: boolean;
   is_active: boolean;
   is_installed: boolean;
+  local_path?: string | null;
+  downloadable: boolean;
 }
 
 export interface AppSnapshot {
@@ -70,4 +77,27 @@ export interface AppSnapshot {
 export interface SendMessageResult {
   user_message: ChatMessage;
   assistant_message: ChatMessage;
+  session_title?: string | null;
+}
+
+export interface DownloadProgressEvent {
+  target_id: string;
+  stage: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  percent: number;
+  message: string;
+  done: boolean;
+  error?: string | null;
+}
+
+export interface LlmStreamEvent {
+  session_id: string;
+  message_id: string;
+  delta: string;
+  full_content: string;
+  stage: string;
+  done: boolean;
+  cancelled: boolean;
+  error?: string | null;
 }

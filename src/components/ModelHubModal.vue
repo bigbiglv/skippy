@@ -5,27 +5,51 @@ import {
   Check,
   Cloud,
   Cpu,
+  Download,
+  FolderOpen,
   HardDrive,
   Play,
   Sparkles,
   Square,
+  Trash2,
   X,
 } from "lucide-vue-next";
-import type { ModelCatalogItem, ModelCategory, PythonEnvInfo } from "../types/skippy";
+import type {
+  DownloadProgressEvent,
+  ModelCatalogItem,
+  ModelCategory,
+  PythonEnvInfo,
+} from "../types/skippy";
 
 const props = defineProps<{
   open: boolean;
   models: ModelCatalogItem[];
   ollamaConnected: boolean;
+  ollamaModels: string[];
   pythonRunning: boolean;
   pythonEnv: PythonEnvInfo;
+  llamaRuntimeReady: boolean;
+  llamaServerRunning: boolean;
+  llamaLoadedModel: string | null;
+  localStorageDir: string;
+  downloadMirror: string;
+  downloadProgress: Record<string, DownloadProgressEvent>;
   workerBusy: boolean;
   workerError: string;
+  llamaBusy: boolean;
+  llamaError: string;
 }>();
 
 const emit = defineEmits<{
   (e: "close"): void;
   (e: "select", category: ModelCategory, modelId: string): void;
+  (e: "install-llama"): void;
+  (e: "start-llama", modelId?: string): void;
+  (e: "stop-llama"): void;
+  (e: "download-model", modelId: string): void;
+  (e: "cancel-download"): void;
+  (e: "import-gguf", modelId: string): void;
+  (e: "delete-model", modelId: string): void;
   (e: "start-worker"): void;
   (e: "stop-worker"): void;
 }>();
@@ -59,10 +83,25 @@ const vramLevel = computed(() => {
   return "ok";
 });
 
+const activeLocalLlm = computed(() =>
+  props.models.find(
+    (m) => m.category === "llm" && m.is_active && m.engine === "llama-server",
+  ),
+);
+
+const runtimeDownload = computed(() => props.downloadProgress["llama-runtime"]);
+
 function formatDisk(mb: number): string {
   if (mb === 0) return "0 MB";
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   return `${mb} MB`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return "0 MB";
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+  return `${mb.toFixed(1)} MB`;
 }
 </script>
 
@@ -73,7 +112,7 @@ function formatDisk(mb: number): string {
     @click.self="emit('close')"
   >
     <div
-      class="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-900"
+      class="flex max-h-[88vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-900"
     >
       <!-- Header -->
       <div class="flex items-center justify-between border-b border-zinc-200 px-5 py-4 dark:border-zinc-800">
@@ -82,7 +121,8 @@ function formatDisk(mb: number): string {
             模型管理与切换中心
           </h2>
           <p class="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
-            按功能环节切换当前激活引擎；待机关闭 GUI 时显存占用为 0
+            纯本地运行无需 Ollama；待机关闭 GUI 时显存占用为 0，存放目录：
+            <span class="font-mono">{{ localStorageDir }}</span>
           </p>
         </div>
         <button
@@ -145,6 +185,18 @@ function formatDisk(mb: number): string {
               </span>
 
               <span
+                v-if="item.engine === 'llama-server'"
+                class="rounded-md px-1.5 py-0.5 text-[11px] font-medium"
+                :class="
+                  item.is_installed
+                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'
+                    : 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400'
+                "
+              >
+                {{ item.is_installed ? "权重已就绪" : "待下载/导入" }}
+              </span>
+
+              <span
                 v-for="tag in item.tags"
                 :key="tag"
                 class="rounded-md bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
@@ -165,10 +217,23 @@ function formatDisk(mb: number): string {
                 预估显存 {{ item.est_vram_mb === 0 ? "0 MB" : `${(item.est_vram_mb / 1024).toFixed(1)} GB` }}
               </span>
               <span
+                v-if="item.local_path"
+                class="max-w-xs truncate font-mono text-[10px] text-zinc-400"
+                :title="item.local_path"
+              >
+                {{ item.local_path }}
+              </span>
+              <span
                 v-if="item.requires_ollama && !ollamaConnected"
                 class="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400"
               >
-                <AlertTriangle class="h-3 w-3" /> 未检测到本机 Ollama（Step 2 接入检测）
+                <AlertTriangle class="h-3 w-3" /> 未检测到本机 Ollama
+              </span>
+              <span
+                v-else-if="item.requires_ollama && ollamaConnected"
+                class="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400"
+              >
+                已检测到模型：{{ ollamaModels.slice(0, 3).join(", ") || "空" }}
               </span>
               <span
                 v-if="item.requires_python && !pythonEnv.venv_ready"
@@ -183,9 +248,46 @@ function formatDisk(mb: number): string {
                 Python 已就绪（待机休眠中，调用时自动拉起）
               </span>
             </div>
+
+            <!-- GGUF download progress bar -->
+            <div
+              v-if="downloadProgress[item.id] && !downloadProgress[item.id].done"
+              class="mt-2.5 space-y-1 rounded-lg border border-blue-200 bg-blue-50/50 p-2 dark:border-blue-900/50 dark:bg-blue-950/30"
+            >
+              <div class="flex items-center justify-between text-[11px] text-blue-700 dark:text-blue-300">
+                <span>
+                  {{ downloadProgress[item.id].message }}
+                  ({{ formatBytes(downloadProgress[item.id].downloaded_bytes) }}
+                  <template v-if="downloadProgress[item.id].total_bytes">
+                    / {{ formatBytes(downloadProgress[item.id].total_bytes) }}
+                  </template>)
+                </span>
+                <div class="flex items-center gap-2">
+                  <span>{{ downloadProgress[item.id].percent }}%</span>
+                  <button
+                    class="text-red-600 hover:underline dark:text-red-400"
+                    @click="emit('cancel-download')"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+              <div class="h-1.5 w-full overflow-hidden rounded-full bg-blue-100 dark:bg-blue-950">
+                <div
+                  class="h-full rounded-full bg-blue-600 transition-all"
+                  :style="{ width: `${downloadProgress[item.id].percent}%` }"
+                />
+              </div>
+            </div>
+            <p
+              v-else-if="downloadProgress[item.id]?.error"
+              class="mt-1.5 text-[11px] text-red-600 dark:text-red-400"
+            >
+              {{ downloadProgress[item.id]?.error }}
+            </p>
           </div>
 
-          <div class="shrink-0">
+          <div class="flex shrink-0 flex-col items-end gap-1.5">
             <button
               class="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition"
               :class="
@@ -198,12 +300,122 @@ function formatDisk(mb: number): string {
               <Check v-if="item.is_active" class="h-3.5 w-3.5" />
               {{ item.is_active ? "已激活" : "切换使用" }}
             </button>
+
+            <div v-if="item.engine === 'llama-server'" class="flex items-center gap-1">
+              <button
+                v-if="item.downloadable && !item.is_installed"
+                :disabled="Boolean(downloadProgress[item.id] && !downloadProgress[item.id].done)"
+                class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-[11px] text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                :title="`从 ${downloadMirror} 下载到 ${localStorageDir}`"
+                @click="emit('download-model', item.id)"
+              >
+                <Download class="h-3 w-3" /> 下载
+              </button>
+              <button
+                class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-[11px] text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                title="选择本机已有的 .gguf 模型文件"
+                @click="emit('import-gguf', item.id)"
+              >
+                <FolderOpen class="h-3 w-3" /> 导入
+              </button>
+              <button
+                v-if="item.is_installed"
+                class="rounded-md border border-zinc-200 p-1 text-zinc-400 hover:border-red-300 hover:text-red-500 dark:border-zinc-700"
+                title="移除模型关联/删除已下载权重"
+                @click="emit('delete-model', item.id)"
+              >
+                <Trash2 class="h-3 w-3" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- Footer VRAM Estimator & Worker Status -->
-      <div class="space-y-3 border-t border-zinc-200 bg-zinc-50/80 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+      <!-- Footer Runtime Bars & VRAM Estimator -->
+      <div class="space-y-2.5 border-t border-zinc-200 bg-zinc-50/80 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+        <!-- Built-in llama-server CUDA Runtime -->
+        <div class="space-y-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span
+                class="h-2 w-2 rounded-full"
+                :class="
+                  llamaServerRunning
+                    ? 'bg-emerald-500'
+                    : llamaRuntimeReady
+                      ? 'bg-zinc-400'
+                      : 'bg-amber-500'
+                "
+              />
+              <span class="font-medium text-zinc-800 dark:text-zinc-200">
+                本地大脑引擎 (llama-server CUDA)：
+                <template v-if="llamaServerRunning">
+                  运行中 · {{ llamaLoadedModel || "已加载" }}（空闲自动释放）
+                </template>
+                <template v-else-if="llamaRuntimeReady">
+                  已就绪（待机 0 显存，发消息自动拉起）
+                </template>
+                <template v-else>尚未安装运行时（免装 Ollama，约 480 MB）</template>
+              </span>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <button
+                v-if="!llamaRuntimeReady"
+                :disabled="Boolean(runtimeDownload && !runtimeDownload.done)"
+                class="inline-flex items-center gap-1 rounded-md bg-blue-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-blue-700 disabled:opacity-40"
+                @click="emit('install-llama')"
+              >
+                <Download class="h-3 w-3" />
+                {{ runtimeDownload && !runtimeDownload.done ? "安装中..." : "一键安装引擎" }}
+              </button>
+              <button
+                v-else-if="!llamaServerRunning"
+                :disabled="llamaBusy || !activeLocalLlm?.is_installed"
+                class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+                @click="emit('start-llama', activeLocalLlm?.id)"
+              >
+                <Play class="h-3 w-3" />
+                {{ llamaBusy ? "加载模型中..." : "预热模型" }}
+              </button>
+              <button
+                v-else
+                :disabled="llamaBusy"
+                class="inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50 px-2.5 py-1 text-[11px] font-medium text-red-700 hover:bg-red-100 disabled:opacity-40 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300"
+                @click="emit('stop-llama')"
+              >
+                <Square class="h-3 w-3" />
+                {{ llamaBusy ? "释放中..." : "立即释放" }}
+              </button>
+            </div>
+          </div>
+
+          <div
+            v-if="runtimeDownload && !runtimeDownload.done"
+            class="space-y-1 pt-1"
+          >
+            <div class="flex items-center justify-between text-[11px] text-blue-600 dark:text-blue-400">
+              <span>{{ runtimeDownload.message }}</span>
+              <div class="flex items-center gap-2">
+                <span>{{ runtimeDownload.percent }}%</span>
+                <button class="text-red-500 hover:underline" @click="emit('cancel-download')">
+                  取消
+                </button>
+              </div>
+            </div>
+            <div class="h-1.5 w-full overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+              <div
+                class="h-full rounded-full bg-blue-600 transition-all"
+                :style="{ width: `${runtimeDownload.percent}%` }"
+              />
+            </div>
+          </div>
+          <p v-if="llamaError || runtimeDownload?.error" class="text-[11px] text-red-600 dark:text-red-400">
+            {{ llamaError || runtimeDownload?.error }}
+          </p>
+        </div>
+
+        <!-- On-demand Python AI Worker -->
         <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
           <div class="flex items-center gap-2">
             <span
@@ -211,7 +423,7 @@ function formatDisk(mb: number): string {
               :class="pythonRunning ? 'bg-emerald-500' : pythonEnv.venv_ready ? 'bg-zinc-400' : 'bg-amber-500'"
             />
             <span class="font-medium text-zinc-800 dark:text-zinc-200">
-              按需 Python AI Worker：
+              按需 Python AI Worker（重型语音/视觉预留）：
               <template v-if="pythonRunning">运行中（空闲自动回收）</template>
               <template v-else-if="pythonEnv.venv_ready">
                 待机休眠 · {{ pythonEnv.python_version || "Python" }} 已就绪
@@ -243,6 +455,7 @@ function formatDisk(mb: number): string {
         </div>
         <p v-if="workerError" class="text-[11px] text-red-600 dark:text-red-400">{{ workerError }}</p>
 
+        <!-- VRAM Bar -->
         <div>
           <div class="flex items-center justify-between text-xs">
             <span class="font-medium text-zinc-700 dark:text-zinc-300">

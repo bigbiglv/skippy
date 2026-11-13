@@ -1,14 +1,16 @@
 mod commands;
+mod llm;
 mod models;
 mod state;
 mod storage;
 mod worker;
 
+use llm::llama_supervisor::LlamaSupervisor;
 use state::{AppState, RuntimeStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use storage::chat_repo::get_all_settings;
+use storage::chat_repo::{get_all_settings, resolve_local_storage_dir};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewWindowBuilder};
@@ -65,16 +67,26 @@ pub fn run() {
 
             let worker = WorkerSupervisor::new(18765);
             let python_env = worker.detect_env();
+            let storage_dir = resolve_local_storage_dir(&conn, &data_dir);
+            let llama_ready = LlamaSupervisor::find_binary(&storage_dir).is_some();
+            let llama = LlamaSupervisor::new(18766);
 
             app.manage(AppState {
                 db: Mutex::new(conn),
                 data_dir,
-                status: Mutex::new(RuntimeStatus::with_env(python_env)),
+                status: Mutex::new(RuntimeStatus::with_env(
+                    python_env,
+                    llama_ready,
+                    storage_dir.to_string_lossy().to_string(),
+                )),
                 worker: Mutex::new(worker),
+                llama: Mutex::new(llama),
+                chat_cancel: Arc::new(AtomicBool::new(false)),
+                download_cancel: Arc::new(AtomicBool::new(false)),
                 should_exit: AtomicBool::new(false),
             });
 
-            // 后台空闲超时回收循环（Idle TTL）：自动终止闲置的按需 Worker 释放内存与显存
+            // 后台空闲超时回收循环（Idle TTL）：自动终止闲置的 Worker 与 llama-server 释放内存与显存
             let reaper_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -94,7 +106,7 @@ pub fn run() {
                         continue;
                     }
 
-                    let stopped = if let Ok(mut w) = state.worker.lock() {
+                    let worker_stopped = if let Ok(mut w) = state.worker.lock() {
                         if w.is_running()
                             && w.idle_elapsed_secs().is_some_and(|elapsed| elapsed >= ttl_secs)
                         {
@@ -106,10 +118,30 @@ pub fn run() {
                         false
                     };
 
-                    if stopped {
+                    let llama_stopped = if let Ok(mut l) = state.llama.lock() {
+                        if l.is_running()
+                            && l.idle_elapsed_secs().is_some_and(|elapsed| elapsed >= ttl_secs)
+                        {
+                            l.stop()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if worker_stopped || llama_stopped {
                         if let Ok(mut st) = state.status.lock() {
-                            st.python_worker_running = false;
-                            st.gpu_vram_active_mb = 0;
+                            if worker_stopped {
+                                st.python_worker_running = false;
+                            }
+                            if llama_stopped {
+                                st.llama_server_running = false;
+                                st.llama_loaded_model = None;
+                            }
+                            if !st.python_worker_running && !st.llama_server_running {
+                                st.gpu_vram_active_mb = 0;
+                            }
                         }
                     }
                 }
@@ -129,6 +161,9 @@ pub fn run() {
                         let state = app.state::<AppState>();
                         if let Ok(mut w) = state.worker.lock() {
                             w.stop();
+                        }
+                        if let Ok(mut l) = state.llama.lock() {
+                            l.stop();
                         }
                         state.should_exit.store(true, Ordering::Relaxed);
                         app.exit(0);
@@ -174,8 +209,18 @@ pub fn run() {
             commands::delete_chat_session,
             commands::get_session_messages,
             commands::send_text_message,
+            commands::stop_generation,
             commands::select_active_model,
             commands::update_app_setting,
+            commands::install_llama_runtime,
+            commands::download_gguf_model,
+            commands::cancel_download,
+            commands::import_local_gguf,
+            commands::delete_local_model,
+            commands::start_llama_server,
+            commands::stop_llama_server,
+            commands::pick_local_gguf_file,
+            commands::pick_storage_directory,
             commands::start_python_worker,
             commands::stop_python_worker,
         ])

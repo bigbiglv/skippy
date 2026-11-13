@@ -49,11 +49,22 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
         ",
     )?;
 
-    seed_defaults(&conn)?;
+    seed_defaults(&conn, db_path.parent())?;
     Ok(conn)
 }
 
-fn seed_defaults(conn: &Connection) -> Result<()> {
+fn default_local_storage_dir(data_dir: Option<&Path>) -> String {
+    if Path::new("D:\\").exists() {
+        "D:\\SkippyData".to_string()
+    } else if let Some(dir) = data_dir {
+        dir.join("local").to_string_lossy().to_string()
+    } else {
+        "SkippyData".to_string()
+    }
+}
+
+fn seed_defaults(conn: &Connection, data_dir: Option<&Path>) -> Result<()> {
+    let storage_dir = default_local_storage_dir(data_dir);
     let default_settings = [
         ("theme", "system"),
         ("wake_mode", "shortcut"),
@@ -62,10 +73,14 @@ fn seed_defaults(conn: &Connection) -> Result<()> {
         ("idle_unload_secs", "180"),
         ("audio_ducking", "true"),
         ("persona_mode", "butler"),
+        ("local_storage_dir", storage_dir.as_str()),
+        ("download_mirror", "modelscope"),
+        ("github_mirror", ""),
         ("cloud_base_url", "https://api.deepseek.com/v1"),
         ("cloud_model", "deepseek-chat"),
         ("cloud_api_key", ""),
         ("ollama_base_url", "http://127.0.0.1:11434"),
+        ("ollama_model", ""),
     ];
 
     for (k, v) in default_settings {
@@ -83,9 +98,9 @@ fn seed_defaults(conn: &Connection) -> Result<()> {
         ("asr", "paraformer-zh-streaming", 0, 0),
         ("asr", "qwen3-asr-0.6b-gpu", 0, 0),
         ("asr", "cloud-asr-api", 0, 1),
-        ("llm", "cloud-openai-compat", 1, 1),
+        ("llm", "cloud-openai-compat", 0, 1),
         ("llm", "llama-qwen3-4b-gguf", 0, 0),
-        ("llm", "llama-qwen3-8b-gguf", 0, 0),
+        ("llm", "llama-qwen3-8b-gguf", 1, 0),
         ("llm", "llama-uitars-1.5-7b-gguf", 0, 0),
         ("llm", "ollama-external", 0, 0),
         ("tts", "edge-tts-online", 1, 1),
@@ -98,6 +113,43 @@ fn seed_defaults(conn: &Connection) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO model_configs (category, model_id, is_active, is_installed) VALUES (?1, ?2, ?3, ?4)",
             params![cat, id, active, installed],
+        )?;
+    }
+
+    // 针对尚未配置过云端 Key 的已有本地库，一次性将默认大脑迁移为纯本地 Qwen3-8B GGUF
+    let already_migrated: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'migrated_local_default_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if already_migrated.is_none() {
+        let cloud_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM model_configs WHERE category = 'llm' AND model_id = 'cloud-openai-compat'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let cloud_key: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'cloud_api_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+
+        if cloud_active != 0 && cloud_key.trim().is_empty() {
+            conn.execute("UPDATE model_configs SET is_active = 0 WHERE category = 'llm'", [])?;
+            conn.execute(
+                "UPDATE model_configs SET is_active = 1 WHERE category = 'llm' AND model_id = 'llama-qwen3-8b-gguf'",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('migrated_local_default_v1', '1')",
+            [],
         )?;
     }
 

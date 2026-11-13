@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Bot,
   Boxes,
@@ -12,6 +13,7 @@ import {
   Send,
   Settings,
   Smartphone,
+  Square,
   Trash2,
 } from "lucide-vue-next";
 import ModelHubModal from "./components/ModelHubModal.vue";
@@ -20,6 +22,8 @@ import type {
   AppSnapshot,
   ChatMessage,
   ChatSession,
+  DownloadProgressEvent,
+  LlmStreamEvent,
   ModelCatalogItem,
   ModelCategory,
   RuntimeStatus,
@@ -30,11 +34,13 @@ const loading = ref(true);
 const sidebarOpen = ref(true);
 const modelHubOpen = ref(false);
 const settingsOpen = ref(false);
+const messagePaneRef = ref<HTMLElement | null>(null);
 
 const status = ref<RuntimeStatus>({
   stage: "shortcut_only",
   stage_label: "初始化中...",
   ollama_connected: false,
+  ollama_models: [],
   python_worker_running: false,
   python_env: {
     python_available: false,
@@ -43,10 +49,17 @@ const status = ref<RuntimeStatus>({
     venv_ready: false,
     worker_script_found: false,
   },
+  llama_runtime_ready: false,
+  llama_server_running: false,
+  llama_loaded_model: null,
+  local_storage_dir: "D:\\SkippyData",
   gpu_vram_active_mb: 0,
 });
 const workerBusy = ref(false);
 const workerError = ref("");
+const llamaBusy = ref(false);
+const llamaError = ref("");
+const downloadProgress = ref<Record<string, DownloadProgressEvent>>({});
 const sessions = ref<ChatSession[]>([]);
 const activeSessionId = ref<string>("");
 const messages = ref<ChatMessage[]>([]);
@@ -55,12 +68,67 @@ const settings = ref<Record<string, string>>({});
 const dataDir = ref("");
 const inputText = ref("");
 const sending = ref(false);
+const streamStage = ref("");
 const loadError = ref("");
 const isTauriRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const activeLlm = computed(
   () => models.value.find((m) => m.category === "llm" && m.is_active)?.name ?? "未选择大脑",
 );
+
+const activeLlmItem = computed(() =>
+  models.value.find((m) => m.category === "llm" && m.is_active),
+);
+
+function scrollToBottom() {
+  nextTick(() => {
+    const el = messagePaneRef.value;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+}
+
+function splitThinking(raw: string): { think: string; answer: string; thinkingOpen: boolean } {
+  const start = raw.indexOf("<think>");
+  if (start === -1) {
+    return { think: "", answer: raw, thinkingOpen: false };
+  }
+  const afterStart = raw.slice(start + 7);
+  const end = afterStart.indexOf("</think>");
+  if (end === -1) {
+    return { think: afterStart.trim(), answer: "", thinkingOpen: true };
+  }
+  const think = afterStart.slice(0, end).trim();
+  const answer = (raw.slice(0, start) + afterStart.slice(end + 8)).trim();
+  return { think, answer, thinkingOpen: false };
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatMarkdownBasic(text: string): string {
+  const parts = text.split(/```(\w*)\n?([\s\S]*?)```/g);
+  let out = "";
+  for (let i = 0; i < parts.length; i += 3) {
+    const prose = escapeHtml(parts[i] ?? "")
+      .replace(/`([^`\n]+)`/g, '<code class="rounded bg-zinc-200/80 px-1 py-0.5 font-mono text-[12px] dark:bg-zinc-800">$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\n/g, "<br/>");
+    out += prose;
+    if (i + 2 < parts.length) {
+      const code = escapeHtml(parts[i + 2] ?? "");
+      out += `<pre class="my-2 overflow-x-auto rounded-lg bg-zinc-900 p-3 font-mono text-xs text-zinc-100"><code>${code}</code></pre>`;
+    }
+  }
+  return out;
+}
 
 function applyTheme(theme: string | undefined) {
   const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -107,6 +175,14 @@ async function loadSnapshot() {
 async function loadMessages(sessionId: string) {
   activeSessionId.value = sessionId;
   messages.value = await invoke<ChatMessage[]>("get_session_messages", { sessionId });
+  scrollToBottom();
+}
+
+async function refreshSnapshotStatus() {
+  const snap = await invoke<AppSnapshot>("get_app_snapshot");
+  status.value = snap.status;
+  models.value = snap.models;
+  settings.value = snap.settings;
 }
 
 async function handleCreateSession() {
@@ -133,16 +209,71 @@ async function handleSend() {
   const text = inputText.value.trim();
   if (!text || !activeSessionId.value || sending.value) return;
   sending.value = true;
+  streamStage.value = "preparing";
   inputText.value = "";
+
+  const sid = activeSessionId.value;
+  const tempUserId = `temp-user-${Date.now()}`;
+  const tempAssistantId = `temp-assistant-${Date.now()}`;
+  const nowIso = new Date().toISOString();
+
+  messages.value.push(
+    {
+      id: tempUserId,
+      session_id: sid,
+      role: "user",
+      source: "pc_text",
+      content: text,
+      created_at: nowIso,
+    },
+    {
+      id: tempAssistantId,
+      session_id: sid,
+      role: "assistant",
+      source: "pc_text",
+      content: "",
+      model_used: activeLlm.value,
+      created_at: nowIso,
+    },
+  );
+  scrollToBottom();
+
   try {
     const res = await invoke<SendMessageResult>("send_text_message", {
-      sessionId: activeSessionId.value,
+      sessionId: sid,
       content: text,
     });
-    messages.value.push(res.user_message, res.assistant_message);
+
+    const userIdx = messages.value.findIndex((m) => m.id === tempUserId);
+    if (userIdx !== -1) messages.value[userIdx] = res.user_message;
+
+    const assistantIdx = messages.value.findIndex((m) => m.id === tempAssistantId);
+    if (assistantIdx !== -1) messages.value[assistantIdx] = res.assistant_message;
+
+    if (res.session_title) {
+      const targetSession = sessions.value.find((s) => s.id === sid);
+      if (targetSession) targetSession.title = res.session_title;
+    }
+
+    await refreshSnapshotStatus();
+    scrollToBottom();
+  } catch (err) {
+    const assistantIdx = messages.value.findIndex((m) => m.id === tempAssistantId);
+    if (assistantIdx !== -1) {
+      messages.value[assistantIdx] = {
+        ...messages.value[assistantIdx],
+        content: `发送失败：${String(err)}`,
+        model_used: "system-error",
+      };
+    }
   } finally {
     sending.value = false;
+    streamStage.value = "";
   }
+}
+
+async function handleStopGeneration() {
+  await invoke("stop_generation");
 }
 
 async function handleSelectModel(category: ModelCategory, modelId: string) {
@@ -150,8 +281,7 @@ async function handleSelectModel(category: ModelCategory, modelId: string) {
     category,
     modelId,
   });
-  const snap = await invoke<AppSnapshot>("get_app_snapshot");
-  status.value = snap.status;
+  await refreshSnapshotStatus();
 }
 
 async function handleUpdateSetting(key: string, value: string) {
@@ -159,6 +289,96 @@ async function handleUpdateSetting(key: string, value: string) {
     key,
     value,
   });
+  if (key === "local_storage_dir") {
+    await refreshSnapshotStatus();
+  }
+}
+
+async function handlePickStorageDir() {
+  const picked = await invoke<string | null>("pick_storage_directory", {
+    initial: settings.value.local_storage_dir || status.value.local_storage_dir,
+  });
+  if (picked) {
+    await handleUpdateSetting("local_storage_dir", picked);
+  }
+}
+
+async function handleInstallLlama() {
+  llamaError.value = "";
+  try {
+    status.value = await invoke<RuntimeStatus>("install_llama_runtime", {
+      mirror: settings.value.github_mirror || null,
+    });
+  } catch (err) {
+    llamaError.value = String(err);
+  }
+}
+
+async function handleStartLlama(modelId?: string) {
+  llamaBusy.value = true;
+  llamaError.value = "";
+  try {
+    status.value = await invoke<RuntimeStatus>("start_llama_server", {
+      modelId: modelId || null,
+    });
+  } catch (err) {
+    llamaError.value = String(err);
+  } finally {
+    llamaBusy.value = false;
+  }
+}
+
+async function handleStopLlama() {
+  llamaBusy.value = true;
+  llamaError.value = "";
+  try {
+    status.value = await invoke<RuntimeStatus>("stop_llama_server");
+  } catch (err) {
+    llamaError.value = String(err);
+  } finally {
+    llamaBusy.value = false;
+  }
+}
+
+async function handleDownloadModel(modelId: string) {
+  try {
+    models.value = await invoke<ModelCatalogItem[]>("download_gguf_model", {
+      modelId,
+      mirror: settings.value.download_mirror || "modelscope",
+    });
+  } catch (err) {
+    llamaError.value = String(err);
+  }
+}
+
+async function handleCancelDownload() {
+  await invoke("cancel_download");
+}
+
+async function handleImportGguf(modelId: string) {
+  llamaError.value = "";
+  const filePath = await invoke<string | null>("pick_local_gguf_file");
+  if (!filePath) return;
+  try {
+    models.value = await invoke<ModelCatalogItem[]>("import_local_gguf", {
+      modelId,
+      filePath,
+    });
+    await refreshSnapshotStatus();
+  } catch (err) {
+    llamaError.value = String(err);
+  }
+}
+
+async function handleDeleteModel(modelId: string) {
+  try {
+    models.value = await invoke<ModelCatalogItem[]>("delete_local_model", {
+      modelId,
+    });
+    await refreshSnapshotStatus();
+  } catch (err) {
+    llamaError.value = String(err);
+  }
 }
 
 async function handleStartWorker() {
@@ -166,8 +386,7 @@ async function handleStartWorker() {
   workerError.value = "";
   try {
     await invoke("start_python_worker");
-    const snap = await invoke<AppSnapshot>("get_app_snapshot");
-    status.value = snap.status;
+    await refreshSnapshotStatus();
   } catch (err) {
     workerError.value = String(err);
   } finally {
@@ -200,11 +419,46 @@ function sourceLabel(source: ChatMessage["source"]): string {
   }
 }
 
-onMounted(() => {
+let unlistenDownload: UnlistenFn | null = null;
+let unlistenStream: UnlistenFn | null = null;
+
+onMounted(async () => {
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
     applyTheme(settings.value.theme);
   });
-  loadSnapshot();
+
+  if (isTauriRuntime) {
+    unlistenDownload = await listen<DownloadProgressEvent>("download-progress", (evt) => {
+      downloadProgress.value = {
+        ...downloadProgress.value,
+        [evt.payload.target_id]: evt.payload,
+      };
+    });
+
+    unlistenStream = await listen<LlmStreamEvent>("llm-stream", (evt) => {
+      const p = evt.payload;
+      if (p.session_id !== activeSessionId.value) return;
+      streamStage.value = p.stage;
+
+      const idx = messages.value.findIndex(
+        (m) => m.id === p.message_id || m.id.startsWith("temp-assistant-"),
+      );
+      if (idx !== -1 && p.full_content) {
+        messages.value[idx] = {
+          ...messages.value[idx],
+          content: p.full_content,
+        };
+        scrollToBottom();
+      }
+    });
+  }
+
+  await loadSnapshot();
+});
+
+onUnmounted(() => {
+  unlistenDownload?.();
+  unlistenStream?.();
 });
 </script>
 
@@ -305,8 +559,28 @@ onMounted(() => {
         </div>
       </header>
 
+      <!-- Quick Setup Hint for Pure Local Mode -->
+      <div
+        v-if="!loadError && activeLlmItem && activeLlmItem.engine === 'llama-server' && (!status.llama_runtime_ready || !activeLlmItem.is_installed)"
+        class="flex items-center justify-between border-b border-blue-200 bg-blue-50/80 px-4 py-2 text-xs text-blue-800 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-200"
+      >
+        <span>
+          纯本地大脑待就绪：
+          <template v-if="!status.llama_runtime_ready">需要先安装内置 llama-server 引擎</template>
+          <template v-if="!status.llama_runtime_ready && !activeLlmItem.is_installed">，并</template>
+          <template v-if="!activeLlmItem.is_installed">下载或导入 {{ activeLlmItem.name }} 权重</template>
+          （将存放于 <span class="font-mono">{{ status.local_storage_dir }}</span>）
+        </span>
+        <button
+          class="rounded-md bg-blue-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-blue-700"
+          @click="modelHubOpen = true"
+        >
+          打开模型管理配置
+        </button>
+      </div>
+
       <!-- Messages -->
-      <main class="flex-1 space-y-4 overflow-y-auto px-6 py-5">
+      <main ref="messagePaneRef" class="flex-1 space-y-4 overflow-y-auto px-6 py-5">
         <div v-if="loading" class="text-center text-xs text-zinc-400">正在同步历史记录...</div>
 
         <div
@@ -334,7 +608,34 @@ onMounted(() => {
               <span>{{ sourceLabel(msg.source) }}</span>
               <span v-if="msg.model_used">· {{ msg.model_used }}</span>
             </div>
-            <div class="whitespace-pre-wrap">{{ msg.content }}</div>
+
+            <div
+              v-if="msg.role === 'assistant' && !msg.content && sending && msg.id.startsWith('temp-assistant-')"
+              class="text-xs text-zinc-400"
+            >
+              {{ streamStage === "loading_model" ? "正在加载本地模型至 RTX 5070 显存..." : "Skippy 思考中..." }}
+            </div>
+
+            <template v-else-if="msg.role === 'assistant'">
+              <details
+                v-if="splitThinking(msg.content).think"
+                :open="splitThinking(msg.content).thinkingOpen"
+                class="mb-2 rounded-lg border border-zinc-200 bg-white/70 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-700 dark:bg-zinc-950/50 dark:text-zinc-400"
+              >
+                <summary class="cursor-pointer font-medium select-none">思考过程</summary>
+                <div class="mt-1.5 whitespace-pre-wrap leading-relaxed">
+                  {{ splitThinking(msg.content).think }}
+                </div>
+              </details>
+              <!-- eslint-disable-next-line vue/no-v-html -->
+              <div
+                v-if="splitThinking(msg.content).answer"
+                class="break-words"
+                v-html="formatMarkdownBasic(splitThinking(msg.content).answer)"
+              />
+            </template>
+
+            <div v-else class="whitespace-pre-wrap">{{ msg.content }}</div>
           </div>
         </div>
       </main>
@@ -358,7 +659,16 @@ onMounted(() => {
             @keydown.enter.exact.prevent="handleSend"
           />
           <button
-            :disabled="!inputText.trim() || sending"
+            v-if="sending"
+            class="inline-flex items-center gap-1 rounded-lg bg-red-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-red-700"
+            @click="handleStopGeneration"
+          >
+            <Square class="h-3.5 w-3.5" />
+            <span>停止</span>
+          </button>
+          <button
+            v-else
+            :disabled="!inputText.trim()"
             class="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-blue-700 disabled:opacity-40"
             @click="handleSend"
           >
@@ -374,12 +684,28 @@ onMounted(() => {
       :open="modelHubOpen"
       :models="models"
       :ollama-connected="status.ollama_connected"
+      :ollama-models="status.ollama_models"
       :python-running="status.python_worker_running"
       :python-env="status.python_env"
+      :llama-runtime-ready="status.llama_runtime_ready"
+      :llama-server-running="status.llama_server_running"
+      :llama-loaded-model="status.llama_loaded_model"
+      :local-storage-dir="status.local_storage_dir"
+      :download-mirror="settings.download_mirror || 'modelscope'"
+      :download-progress="downloadProgress"
       :worker-busy="workerBusy"
       :worker-error="workerError"
+      :llama-busy="llamaBusy"
+      :llama-error="llamaError"
       @close="modelHubOpen = false"
       @select="handleSelectModel"
+      @install-llama="handleInstallLlama"
+      @start-llama="handleStartLlama"
+      @stop-llama="handleStopLlama"
+      @download-model="handleDownloadModel"
+      @cancel-download="handleCancelDownload"
+      @import-gguf="handleImportGguf"
+      @delete-model="handleDeleteModel"
       @start-worker="handleStartWorker"
       @stop-worker="handleStopWorker"
     />
@@ -388,8 +714,12 @@ onMounted(() => {
       :open="settingsOpen"
       :settings="settings"
       :data-dir="dataDir"
+      :local-storage-dir="status.local_storage_dir"
+      :ollama-connected="status.ollama_connected"
+      :ollama-models="status.ollama_models"
       @close="settingsOpen = false"
       @update="handleUpdateSetting"
+      @pick-storage-dir="handlePickStorageDir"
     />
   </div>
 </template>

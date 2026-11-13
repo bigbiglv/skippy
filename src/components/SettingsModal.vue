@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { X } from "lucide-vue-next";
+import { FolderOpen, X } from "lucide-vue-next";
 
 const props = defineProps<{
   open: boolean;
   settings: Record<string, string>;
   dataDir: string;
+  localStorageDir: string;
+  ollamaConnected: boolean;
+  ollamaModels: string[];
 }>();
 
 const emit = defineEmits<{
   (e: "close"): void;
   (e: "update", key: string, value: string): void;
+  (e: "pick-storage-dir"): void;
 }>();
 </script>
 
@@ -97,46 +101,131 @@ const emit = defineEmits<{
           </select>
         </div>
 
-        <!-- Cloud API -->
+        <!-- Local Storage & Mirrors -->
         <div class="space-y-3 rounded-xl border border-zinc-200 p-3.5 dark:border-zinc-800">
           <div class="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
-            云端 OpenAI 兼容接口（Step 2 启用对话）
+            本地引擎与模型存放位置（推荐 D 盘）
           </div>
-          <div>
-            <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">Base URL</label>
+          <div class="flex gap-2">
             <input
               type="text"
-              :value="settings.cloud_base_url || ''"
-              class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
-              @change="emit('update', 'cloud_base_url', ($event.target as HTMLInputElement).value)"
+              :value="settings.local_storage_dir || localStorageDir"
+              class="flex-1 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 font-mono text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+              @change="emit('update', 'local_storage_dir', ($event.target as HTMLInputElement).value)"
             />
+            <button
+              class="inline-flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+              @click="emit('pick-storage-dir')"
+            >
+              <FolderOpen class="h-3.5 w-3.5" />
+              选择目录
+            </button>
           </div>
+
           <div class="grid grid-cols-2 gap-2">
             <div>
-              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">Model ID</label>
-              <input
-                type="text"
-                :value="settings.cloud_model || ''"
+              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">GGUF 权重下载镜像</label>
+              <select
+                :value="settings.download_mirror || 'modelscope'"
                 class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
-                @change="emit('update', 'cloud_model', ($event.target as HTMLInputElement).value)"
-              />
+                @change="emit('update', 'download_mirror', ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="modelscope">魔搭 ModelScope（国内高速）</option>
+                <option value="hf-mirror">HF-Mirror 镜像</option>
+                <option value="huggingface">HuggingFace 官方</option>
+              </select>
             </div>
             <div>
-              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">API Key</label>
+              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">GitHub 加速前缀（可选）</label>
               <input
-                type="password"
-                :value="settings.cloud_api_key || ''"
-                placeholder="sk-..."
+                type="text"
+                :value="settings.github_mirror || ''"
+                placeholder="直连留空，例如 https://gh-proxy.com"
                 class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
-                @change="emit('update', 'cloud_api_key', ($event.target as HTMLInputElement).value)"
+                @change="emit('update', 'github_mirror', ($event.target as HTMLInputElement).value)"
               />
             </div>
           </div>
         </div>
 
+        <!-- Optional Ollama Reuse -->
+        <div class="space-y-3 rounded-xl border border-zinc-200 p-3.5 dark:border-zinc-800">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-semibold text-zinc-800 dark:text-zinc-200">
+              本机已有 Ollama（可选复用）
+            </span>
+            <span
+              class="text-[11px]"
+              :class="ollamaConnected ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-400'"
+            >
+              {{ ollamaConnected ? `已检测到 (${ollamaModels.length} 个模型)` : "未检测到运行中实例" }}
+            </span>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">Ollama 地址</label>
+              <input
+                type="text"
+                :value="settings.ollama_base_url || 'http://127.0.0.1:11434'"
+                class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+                @change="emit('update', 'ollama_base_url', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div>
+              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">Ollama 模型名（留空自动选）</label>
+              <input
+                type="text"
+                :value="settings.ollama_model || ''"
+                :placeholder="ollamaModels[0] || '例如 qwen3:8b'"
+                class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+                @change="emit('update', 'ollama_model', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+          </div>
+        </div>
+
+        <!-- Optional Cloud API -->
+        <details class="rounded-xl border border-zinc-200 p-3.5 dark:border-zinc-800">
+          <summary class="cursor-pointer text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+            云端 OpenAI 兼容接口（可选 · 纯本地模式下无需填写）
+          </summary>
+          <div class="mt-3 space-y-3">
+            <div>
+              <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">Base URL</label>
+              <input
+                type="text"
+                :value="settings.cloud_base_url || ''"
+                class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+                @change="emit('update', 'cloud_base_url', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">Model ID</label>
+                <input
+                  type="text"
+                  :value="settings.cloud_model || ''"
+                  class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+                  @change="emit('update', 'cloud_model', ($event.target as HTMLInputElement).value)"
+                />
+              </div>
+              <div>
+                <label class="block text-[11px] text-zinc-500 dark:text-zinc-400">API Key</label>
+                <input
+                  type="password"
+                  :value="settings.cloud_api_key || ''"
+                  placeholder="sk-..."
+                  class="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-900 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+                  @change="emit('update', 'cloud_api_key', ($event.target as HTMLInputElement).value)"
+                />
+              </div>
+            </div>
+          </div>
+        </details>
+
         <!-- Local Data Path -->
         <div class="rounded-lg bg-zinc-50 px-3 py-2 text-[11px] text-zinc-500 dark:bg-zinc-950/60 dark:text-zinc-400">
-          数据与模型目录（不入 Git）：<span class="font-mono">{{ dataDir }}</span>
+          数据库目录（不入 Git）：<span class="font-mono">{{ dataDir }}</span>
         </div>
       </div>
     </div>

@@ -128,3 +128,47 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     )?;
     Ok(())
 }
+
+pub fn update_message_content(
+    conn: &Connection,
+    message_id: &str,
+    content: &str,
+    model_used: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET content = ?1, model_used = ?2 WHERE id = ?3",
+        params![content, model_used, message_id],
+    )?;
+    Ok(())
+}
+
+pub fn update_session_title(conn: &Connection, session_id: &str, title: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET title = ?1 WHERE id = ?2",
+        params![title, session_id],
+    )?;
+    Ok(())
+}
+
+pub fn resolve_local_storage_dir(conn: &Connection, data_dir: &std::path::Path) -> std::path::PathBuf {
+    let custom: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'local_storage_dir'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if let Some(raw) = custom {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return std::path::PathBuf::from(trimmed);
+        }
+    }
+
+    if std::path::Path::new("D:\\").exists() {
+        std::path::PathBuf::from("D:\\SkippyData")
+    } else {
+        data_dir.join("local")
+    }
+}

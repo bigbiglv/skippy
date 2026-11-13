@@ -1,6 +1,6 @@
 # Skippy 开发待办清单 (TODO)
 
-> **当前阶段**：Phase 1 - Step 1 已完成骨架搭建与本地编译校验，下一步进入 Step 2（接入真实大模型流式对话与 Ollama）
+> **当前阶段**：Phase 1 - Step 2 纯本地大模型接入与流式对话已完成（内置托管 `llama-server` CUDA + D 盘 GGUF 下载/导入 + 流式对话闭环），下一步进入 Step 3（语音唤醒、识别与播报）
 > **最后更新**：2026-11-13
 
 ---
@@ -17,15 +17,14 @@
 - [x] 搭建 Vue 3 主框架（跟随系统浅色/深色主题、左侧可折叠会话栏、主对话区、右上角模型管理弹窗入口、设置弹窗入口）
 - [x] 实现 SQLite 建表与基础 CRUD（`sessions`、`messages`、`model_configs`、`app_settings`）
 
-### Step 2：文字对话流式闭环与模型管理中心（下一步）
-- [ ] 实现统一 `LlmProvider` Trait（基于 OpenAI 兼容流式协议，一套代码通吃本地与云端）
-- [ ] 接入 **OpenAI 兼容云端 API**（支持自定义 Base URL / API Key / Model ID 与 SSE 流式输出）
-- [ ] 实现内置托管 **`llama-server` (`llama.cpp` CUDA) Sidecar 管理器**：
-  - [ ] 首次启用本地 GGUF 时自动下载 `llama-server` 运行时至 `%LocalAppData%\com.bigbiglv.skippy\runtime\`（不绑死重型外部服务）
-  - [ ] 实现按需启动、健康检查、Idle TTL 超时强杀回收 100% 显存
-- [ ] 可选兼容本机已有 **Ollama**（自动探测 `127.0.0.1:11434`，支持 `/api/tags` 复用已有模型与 `keep_alive` 卸载）
-- [ ] 完善 `App.vue`：Markdown 渲染、流式打字机效果、停止生成、会话自动命名
-- [ ] 完善 `ModelHubModal.vue`：GGUF 模型下载器（带进度条与镜像源切换）、本地文件校验与删除
+### Step 2：纯本地大模型与流式对话闭环（已完成，兼顾可选 Ollama / 云端）
+- [x] 实现统一 OpenAI 兼容流式客户端 (`src-tauri/src/llm/client.rs`) 与 `llama-server` / `Ollama` / `Cloud` 统一流式分发
+- [x] 实现内置托管 **`llama-server` (`llama.cpp` CUDA) Sidecar 管理器** (`src-tauri/src/llm/llama_supervisor.rs`)：
+  - [x] 支持在「模型管理」一键下载安装 Windows CUDA 12.4 版 `llama-server` 运行时至自定义目录（默认 `D:\SkippyData\runtime\llama-server\`，免装 Ollama）
+  - [x] 实现按需拉起、`/health` 等待与崩溃日志捕获、15 秒轮询 Idle TTL 超时强杀回收 100% 显存
+- [x] 兼容检测本机已有 **Ollama**（自动探测 `127.0.0.1:11434/api/tags` 并支持对话调用）
+- [x] 完善 `App.vue`：流式打字机输出、Qwen3 `<think>` 思考过程折叠卡片、基础 Markdown 代码块渲染、停止生成、会话自动命名
+- [x] 完善 `ModelHubModal.vue` 与 `SettingsModal.vue`：D 盘目录选择、GGUF 权重下载器（魔搭 ModelScope / HF-Mirror 镜像切换 + 实时进度条 + 取消）、本地 `.gguf` 文件导入与删除
 
 ### Step 3：语音唤醒、识别与播报闭环
 - [ ] 音频采集模块（`cpal` WASAPI 事件驱动 + 无锁 SPSC 环形缓冲）
