@@ -393,10 +393,10 @@ impl<'a> SherpaKws<'a> {
         cfg.model_config.num_threads = 2;
         cfg.model_config.provider = c_prov.as_ptr();
         cfg.model_config.modeling_unit = c_unit.as_ptr();
-        cfg.max_active_paths = 4;
+        cfg.max_active_paths = 8;
         cfg.num_trailing_blanks = 1;
-        cfg.keywords_score = 1.5;
-        cfg.keywords_threshold = 0.18;
+        cfg.keywords_score = 2.2;
+        cfg.keywords_threshold = 0.12;
         cfg.keywords_file = c_kw_file.as_ptr();
 
         unsafe {
@@ -432,7 +432,7 @@ impl<'a> SherpaKws<'a> {
         }
     }
 
-    pub fn feed_and_detect(&self, samples: &[f32]) -> Option<String> {
+    pub fn feed_and_detect(&mut self, samples: &[f32]) -> Option<String> {
         unsafe {
             let accept: libloading::Symbol<
                 unsafe extern "C" fn(*const c_void, i32, *const c_float, i32),
@@ -473,7 +473,25 @@ impl<'a> SherpaKws<'a> {
             }
             destroy_res(res_ptr);
             if hit.is_some() {
-                reset(self.spotter, self.stream);
+                // 每次唤醒后重建在线流，彻底清空前一轮的束搜索/LSTM残留状态，防止二次无法唤醒
+                if let (Ok(create_stream), Ok(destroy_stream)) = (
+                    self.lib
+                        .get::<unsafe extern "C" fn(*const c_void) -> *const c_void>(
+                            b"SherpaOnnxCreateKeywordStream\0",
+                        ),
+                    self.lib
+                        .get::<unsafe extern "C" fn(*const c_void)>(b"SherpaOnnxDestroyOnlineStream\0"),
+                ) {
+                    let fresh = create_stream(self.spotter);
+                    if !fresh.is_null() {
+                        destroy_stream(self.stream);
+                        self.stream = fresh;
+                    } else {
+                        reset(self.spotter, self.stream);
+                    }
+                } else {
+                    reset(self.spotter, self.stream);
+                }
             }
             hit
         }
@@ -802,7 +820,7 @@ mod tests {
             kws_paths.encoder
         );
         let rt = SherpaRuntime::load(&dll).expect("load sherpa dll");
-        let kws = SherpaKws::new(
+        let mut kws = SherpaKws::new(
             &rt,
             &kws_paths.encoder,
             &kws_paths.decoder,
@@ -812,5 +830,33 @@ mod tests {
         )
         .expect("init kws");
         assert!(kws.feed_and_detect(&vec![0.0f32; 1600]).is_none());
+
+        let wav = std::env::temp_dir().join("test_twice.wav");
+        if wav.exists() {
+            let bytes = std::fs::read(&wav).unwrap();
+            let samples: Vec<f32> = bytes[44..]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .collect();
+
+            let mut hits = 0;
+            for pass in 1..=3 {
+                let mut hit = None;
+                for (i, chunk) in samples.chunks(160).enumerate() {
+                    if let Some(kw) = kws.feed_and_detect(chunk) {
+                        eprintln!("PASS {pass} HIT at {i}: {kw}");
+                        hit = Some(kw);
+                        break;
+                    }
+                }
+                if hit.is_some() {
+                    hits += 1;
+                } else {
+                    eprintln!("PASS {pass} MISSED!");
+                }
+                // 模拟录音期没有喂给 KWS，之后紧接着喂下一句唤醒词
+            }
+            assert_eq!(hits, 3, "must wake up all 3 times!");
+        }
     }
 }

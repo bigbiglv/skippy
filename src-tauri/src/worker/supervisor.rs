@@ -1,3 +1,4 @@
+use crate::process_guard::{attach_child_to_job, free_stale_port};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -142,6 +143,8 @@ impl WorkerSupervisor {
             PathBuf::from("python")
         };
 
+        free_stale_port(self.port, "python");
+
         let mut cmd = Command::new(&python_bin);
         cmd.current_dir(&worker_dir)
             .args([
@@ -165,6 +168,7 @@ impl WorkerSupervisor {
         let child = cmd
             .spawn()
             .map_err(|e| format!("启动 Python Worker 失败: {e}"))?;
+        attach_child_to_job(&child);
 
         self.child = Some(child);
         self.last_active = Some(Instant::now());

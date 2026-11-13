@@ -1,6 +1,7 @@
 mod commands;
 mod llm;
 mod models;
+mod process_guard;
 mod state;
 mod storage;
 mod voice;
@@ -247,13 +248,26 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
-        if let RunEvent::ExitRequested { api, code, .. } = event {
-            if code.is_none() {
-                let state = app_handle.state::<AppState>();
-                if !state.should_exit.load(Ordering::Relaxed) {
-                    api.prevent_exit();
+        match event {
+            RunEvent::ExitRequested { api, code, .. } => {
+                if code.is_none() {
+                    let state = app_handle.state::<AppState>();
+                    if !state.should_exit.load(Ordering::Relaxed) {
+                        api.prevent_exit();
+                    }
                 }
             }
+            RunEvent::Exit => {
+                let state = app_handle.state::<AppState>();
+                state.voice.shutdown();
+                if let Ok(mut w) = state.worker.lock() {
+                    w.stop();
+                }
+                if let Ok(mut l) = state.llama.lock() {
+                    l.stop();
+                }
+            }
+            _ => {}
         }
     });
 }

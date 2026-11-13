@@ -1,4 +1,5 @@
 use crate::llm::downloader::{download_file_with_progress, emit_download_progress, DownloadProgressEvent};
+use crate::process_guard::{attach_child_to_job, free_stale_port};
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
@@ -123,6 +124,8 @@ impl LlamaSupervisor {
             "尚未安装内置 llama-server 运行时，请在「模型管理」点击「一键安装引擎」".to_string()
         })?;
 
+        free_stale_port(self.port, "llama-server");
+
         let mut cmd = Command::new(&bin);
         if let Some(bin_dir) = bin.parent() {
             cmd.current_dir(bin_dir);
@@ -149,6 +152,7 @@ impl LlamaSupervisor {
         let child = cmd
             .spawn()
             .map_err(|e| format!("启动 llama-server 失败 ({}): {e}", bin.display()))?;
+        attach_child_to_job(&child);
 
         self.child = Some(child);
         self.loaded_model_id = Some(model_id.to_string());

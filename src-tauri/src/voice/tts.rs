@@ -1,3 +1,4 @@
+use crate::process_guard::attach_child_to_job;
 use rodio::{Decoder, OutputStream, Sink};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Write};
@@ -245,6 +246,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         cmd.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = cmd.spawn().map_err(|e| format!("启动离线 TTS 失败: {e}"))?;
+        attach_child_to_job(&child);
         let stdin = child.stdin.take().ok_or_else(|| "无法打开 TTS stdin".to_string())?;
         let stdout = BufReader::new(child.stdout.take().ok_or_else(|| "无法打开 TTS stdout".to_string())?);
         Ok(Self {

@@ -9,6 +9,7 @@ use crate::voice::sherpa::{AsrKind, SherpaKws, SherpaOfflineAsr, SherpaRuntime, 
 use crate::voice::tts::TtsPlayer;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use pinyin::ToPinyin;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -169,6 +170,7 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
     let mut last_speech_at = Instant::now();
     let mut vad_holder: Option<SherpaVad<'static>> = None;
     let mut kws_holder: Option<SherpaKws<'static>> = None;
+    let mut asr_holder: Option<(String, SherpaOfflineAsr<'static>)> = None;
 
     // 初始加载一次配置
     let mut config_dirty = true;
@@ -183,6 +185,7 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
             config_dirty = false;
             kws_holder.take();
             vad_holder.take();
+            asr_holder.take();
 
             active_wake_word = bundle.wake_word.clone();
             kws_wanted = bundle.kws_id != "shortcut-only";
@@ -195,7 +198,7 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                             sherpa_rt = SherpaRuntime::load(&dll).ok().map(|rt| (dll.clone(), rt));
                         }
                         if let Some((_, ref rt)) = sherpa_rt {
-                            // 安全说明：SherpaRuntime 存活期间 kws_holder/vad_holder 会在重新配置或循环退出前先行 drop
+                            // 安全说明：SherpaRuntime 存活期间 kws_holder/vad_holder/asr_holder 会在重新配置或循环退出前先行 drop
                             let rt_static: &'static SherpaRuntime =
                                 unsafe { &*(rt as *const SherpaRuntime) };
                             match SherpaKws::new(
@@ -211,6 +214,23 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                                     let vad_path = vad_model_path(&bundle.storage_dir);
                                     if vad_path.exists() {
                                         vad_holder = SherpaVad::new(rt_static, &vad_path).ok();
+                                    }
+                                    if let Some(asr_paths) =
+                                        find_asr_paths(&bundle.storage_dir, &bundle.asr_id)
+                                    {
+                                        let kind = if asr_paths.model_id == "paraformer-zh-streaming" {
+                                            AsrKind::Paraformer
+                                        } else {
+                                            AsrKind::SenseVoice
+                                        };
+                                        if let Ok(asr) = SherpaOfflineAsr::new(
+                                            rt_static,
+                                            kind,
+                                            &asr_paths.model_onnx,
+                                            &asr_paths.tokens,
+                                        ) {
+                                            asr_holder = Some((asr_paths.model_id, asr));
+                                        }
                                     }
                                     if mic_handle.is_none() {
                                         match start_mic_capture() {
@@ -291,6 +311,7 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 VoiceCmd::Shutdown => {
+                    asr_holder.take();
                     kws_holder.take();
                     vad_holder.take();
                     drop(mic_handle);
@@ -425,33 +446,97 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
             }
 
             if !recording {
-                if let Some(ref kws) = kws_holder {
-                    if let Some(hit_kw) = kws.feed_and_detect(&chunk) {
-                        tts.stop_speaking();
-                        app.state::<AppState>()
-                            .chat_cancel
-                            .store(true, Ordering::Relaxed);
-                        tts.play_wake_chime();
-                        if let Some(ref v) = vad_holder {
-                            v.clear();
+                let mut woke_label: Option<String> = None;
+                if let Some(ref mut kws) = kws_holder {
+                    woke_label = kws.feed_and_detect(&chunk);
+                }
+
+                if let Some(hit_kw) = woke_label {
+                    tts.stop_speaking();
+                    app.state::<AppState>()
+                        .chat_cancel
+                        .store(true, Ordering::Relaxed);
+                    tts.play_wake_chime();
+                    if let Some(ref v) = vad_holder {
+                        v.clear();
+                    }
+                    manual_session_id = None;
+                    recording = true;
+                    manual_stop_requested = false;
+                    speech_seen = false;
+                    rec_started_at = Instant::now();
+                    last_speech_at = Instant::now();
+                    recorded_samples.clear();
+                    recorded_samples.extend(pre_roll.iter().copied());
+                    update_voice_status(
+                        &app,
+                        VoiceStage::Recording,
+                        &format!("已唤醒（{hit_kw}），请说话..."),
+                        true,
+                        true,
+                        None,
+                        None,
+                    );
+                } else if kws_wanted {
+                    // 双保险：当 KWS 流式声学对特定口音/音量漏检时，用常驻 Silero VAD + 缓存 SenseVoice 核验语音段
+                    if let Some(ref vad) = vad_holder {
+                        vad.accept_waveform(&chunk);
+                        while let Some(seg) = vad.pop_next_segment() {
+                            if seg.len() < 4000 || seg.len() > 72000 {
+                                continue;
+                            }
+                            let Some((_, ref asr)) = asr_holder else {
+                                continue;
+                            };
+                            let Ok(raw) = asr.transcribe(&seg) else {
+                                continue;
+                            };
+                            let cleaned = clean_asr_output(&raw);
+                            let Some((matched, remainder)) =
+                                match_wake_phrase(&cleaned, &active_wake_word)
+                            else {
+                                continue;
+                            };
+
+                            tts.stop_speaking();
+                            app.state::<AppState>()
+                                .chat_cancel
+                                .store(true, Ordering::Relaxed);
+                            tts.play_wake_chime();
+                            vad.clear();
+
+                            let visible_chars = remainder
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .count();
+                            if visible_chars >= 2 {
+                                dispatch_voice_prompt(
+                                    app.clone(),
+                                    remainder,
+                                    None,
+                                    kws_holder.is_some(),
+                                    active_wake_word.clone(),
+                                );
+                            } else {
+                                manual_session_id = None;
+                                recording = true;
+                                manual_stop_requested = false;
+                                speech_seen = false;
+                                rec_started_at = Instant::now();
+                                last_speech_at = Instant::now();
+                                recorded_samples.clear();
+                                update_voice_status(
+                                    &app,
+                                    VoiceStage::Recording,
+                                    &format!("已唤醒（{matched}），请说话..."),
+                                    true,
+                                    true,
+                                    None,
+                                    None,
+                                );
+                            }
+                            break;
                         }
-                        manual_session_id = None;
-                        recording = true;
-                        manual_stop_requested = false;
-                        speech_seen = false;
-                        rec_started_at = Instant::now();
-                        last_speech_at = Instant::now();
-                        recorded_samples.clear();
-                        recorded_samples.extend(pre_roll.iter().copied());
-                        update_voice_status(
-                            &app,
-                            VoiceStage::Recording,
-                            &format!("已唤醒（{hit_kw}），请说话..."),
-                            true,
-                            true,
-                            None,
-                            None,
-                        );
                     }
                 }
             } else {
@@ -482,6 +567,9 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                     recording = false;
                     manual_stop_requested = false;
                     tts.play_stop_chime();
+                    if let Some(ref v) = vad_holder {
+                        v.clear();
+                    }
 
                     let samples = std::mem::take(&mut recorded_samples);
                     if !kws_wanted {
@@ -507,45 +595,33 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                     if let (Some(bundle), Some((_, rt))) =
                         (read_runtime_bundle(&app), sherpa_rt.as_ref())
                     {
-                        if let Some(asr_paths) = find_asr_paths(&bundle.storage_dir, &bundle.asr_id)
-                        {
-                            let kind = if asr_paths.model_id == "paraformer-zh-streaming" {
-                                AsrKind::Paraformer
-                            } else {
-                                AsrKind::SenseVoice
-                            };
-                            match SherpaOfflineAsr::new(
-                                rt,
-                                kind,
-                                &asr_paths.model_onnx,
-                                &asr_paths.tokens,
-                            ) {
-                                Ok(asr) => match asr.transcribe(&samples) {
-                                    Ok(raw_text) => {
-                                        let text = clean_asr_output(&raw_text);
-                                        if text.is_empty() {
-                                            let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
-                                            update_voice_status(
-                                                &app,
-                                                st,
-                                                &lb,
-                                                false,
-                                                kws_holder.is_some(),
-                                                None,
-                                                None,
-                                            );
-                                        } else {
-                                            dispatch_voice_prompt(
-                                                app.clone(),
-                                                text,
-                                                manual_session_id.take(),
-                                                kws_holder.is_some(),
-                                                active_wake_word.clone(),
-                                            );
-                                        }
-                                    }
+                        let rt_static: &'static SherpaRuntime =
+                            unsafe { &*(rt as *const SherpaRuntime) };
+                        let need_reload = asr_holder
+                            .as_ref()
+                            .is_none_or(|(id, _)| id != &bundle.asr_id);
+                        if need_reload {
+                            asr_holder.take();
+                            if let Some(asr_paths) =
+                                find_asr_paths(&bundle.storage_dir, &bundle.asr_id)
+                            {
+                                let kind = if asr_paths.model_id == "paraformer-zh-streaming" {
+                                    AsrKind::Paraformer
+                                } else {
+                                    AsrKind::SenseVoice
+                                };
+                                match SherpaOfflineAsr::new(
+                                    rt_static,
+                                    kind,
+                                    &asr_paths.model_onnx,
+                                    &asr_paths.tokens,
+                                ) {
+                                    Ok(asr) => asr_holder = Some((asr_paths.model_id, asr)),
                                     Err(err) => {
-                                        let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
+                                        let (st, lb) = idle_stage_for_kws(
+                                            kws_holder.is_some(),
+                                            &active_wake_word,
+                                        );
                                         update_voice_status(
                                             &app,
                                             st,
@@ -556,9 +632,41 @@ fn voice_supervisor_loop(app: AppHandle, tts: TtsPlayer, rx: Receiver<VoiceCmd>)
                                             Some(err),
                                         );
                                     }
-                                },
+                                }
+                            }
+                        }
+
+                        if let Some((_, ref asr)) = asr_holder {
+                            match asr.transcribe(&samples) {
+                                Ok(raw_text) => {
+                                    let text = clean_asr_output(&raw_text);
+                                    if text.is_empty() {
+                                        let (st, lb) = idle_stage_for_kws(
+                                            kws_holder.is_some(),
+                                            &active_wake_word,
+                                        );
+                                        update_voice_status(
+                                            &app,
+                                            st,
+                                            &lb,
+                                            false,
+                                            kws_holder.is_some(),
+                                            None,
+                                            None,
+                                        );
+                                    } else {
+                                        dispatch_voice_prompt(
+                                            app.clone(),
+                                            text,
+                                            manual_session_id.take(),
+                                            kws_holder.is_some(),
+                                            active_wake_word.clone(),
+                                        );
+                                    }
+                                }
                                 Err(err) => {
-                                    let (st, lb) = idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
+                                    let (st, lb) =
+                                        idle_stage_for_kws(kws_holder.is_some(), &active_wake_word);
                                     update_voice_status(
                                         &app,
                                         st,
@@ -640,6 +748,135 @@ fn clean_asr_output(raw: &str) -> String {
     }
     out.push_str(rest);
     out.trim().to_string()
+}
+
+/// Convert text into `(start_byte, end_byte, normalized_phonetic_key)` units:
+/// Han characters map to toneless lowercase pinyin (allowing homophone matching),
+/// while contiguous ASCII alphanumeric spans form lowercase word tokens.
+fn to_phonetic_units(text: &str) -> Vec<(usize, usize, String)> {
+    let mut units = Vec::new();
+    let mut ascii_start: Option<usize> = None;
+    let mut ascii_buf = String::new();
+
+    let flush_ascii =
+        |units: &mut Vec<(usize, usize, String)>, start: &mut Option<usize>, buf: &mut String, end: usize| {
+            if let Some(s) = start.take() {
+                if !buf.is_empty() {
+                    units.push((s, end, std::mem::take(buf)));
+                }
+            }
+        };
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            if ascii_start.is_none() {
+                ascii_start = Some(idx);
+            }
+            ascii_buf.push(ch.to_ascii_lowercase());
+            continue;
+        }
+
+        flush_ascii(&mut units, &mut ascii_start, &mut ascii_buf, idx);
+        let end = idx + ch.len_utf8();
+        if let Some(py) = ch.to_pinyin() {
+            units.push((idx, end, py.plain().to_string()));
+        } else if ch.is_alphanumeric() {
+            units.push((idx, end, ch.to_lowercase().to_string()));
+        }
+    }
+
+    flush_ascii(&mut units, &mut ascii_start, &mut ascii_buf, text.len());
+    units
+}
+
+/// Match any configured wake phrase (supports `,` / `，` / `;` / `/` separated aliases)
+/// inside an ASR transcript using toneless pinyin homophone equivalence.
+/// Returns `Some((matched_phrase, trailing_query))`.
+fn match_wake_phrase(transcript: &str, wake_word: &str) -> Option<(String, String)> {
+    let transcript_units = to_phonetic_units(transcript);
+    if transcript_units.is_empty() {
+        return None;
+    }
+
+    for raw_phrase in wake_word.split([',', '，', ';', '；', '/', '\n']) {
+        let phrase = raw_phrase.trim();
+        if phrase.is_empty() {
+            continue;
+        }
+        let wake_units = to_phonetic_units(phrase);
+        let n = wake_units.len();
+        if n == 0 || transcript_units.len() < n {
+            continue;
+        }
+
+        for i in 0..=transcript_units.len() - n {
+            let matched = transcript_units[i..i + n]
+                .iter()
+                .zip(wake_units.iter())
+                .all(|(t, w)| t.2 == w.2);
+            if matched {
+                let end_byte = transcript_units[i + n - 1].1;
+                let remainder = transcript[end_byte..]
+                    .trim_start_matches(|c: char| {
+                        c.is_whitespace()
+                            || matches!(
+                                c,
+                                '，' | '。'
+                                    | '、'
+                                    | '！'
+                                    | '？'
+                                    | '：'
+                                    | '；'
+                                    | ','
+                                    | '.'
+                                    | '!'
+                                    | '?'
+                                    | ':'
+                                    | ';'
+                                    | '-'
+                                    | '—'
+                                    | '～'
+                                    | '~'
+                            )
+                    })
+                    .trim()
+                    .to_string();
+                return Some((phrase.to_string(), remainder));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod wake_phrase_tests {
+    use super::match_wake_phrase;
+
+    #[test]
+    fn matches_exact_homophone_and_one_breath_wake_phrases() {
+        assert_eq!(
+            match_wake_phrase("密探阿泰", "密探阿泰"),
+            Some(("密探阿泰".to_string(), String::new()))
+        );
+        assert_eq!(
+            match_wake_phrase("密探阿太", "密探阿泰"),
+            Some(("密探阿泰".to_string(), String::new()))
+        );
+        assert_eq!(
+            match_wake_phrase("秘探，阿泰！", "密探阿泰"),
+            Some(("密探阿泰".to_string(), String::new()))
+        );
+        assert_eq!(
+            match_wake_phrase("密探阿泰，今天天气怎么样", "密探阿泰"),
+            Some(("密探阿泰".to_string(), "今天天气怎么样".to_string()))
+        );
+        assert_eq!(
+            match_wake_phrase("Hey Skippy, what time is it", "密探阿泰, Skippy"),
+            Some(("Skippy".to_string(), "what time is it".to_string()))
+        );
+        assert_eq!(match_wake_phrase("I said hello", "ai"), None);
+    }
 }
 
 fn chunk_rms(samples: &[f32]) -> f32 {
