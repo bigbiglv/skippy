@@ -55,6 +55,8 @@ const settings = ref<Record<string, string>>({});
 const dataDir = ref("");
 const inputText = ref("");
 const sending = ref(false);
+const loadError = ref("");
+const isTauriRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const activeLlm = computed(
   () => models.value.find((m) => m.category === "llm" && m.is_active)?.name ?? "未选择大脑",
@@ -72,6 +74,15 @@ watch(
 );
 
 async function loadSnapshot() {
+  if (!isTauriRuntime) {
+    status.value.stage_label = "网页预览模式（无桌面后端）";
+    loadError.value =
+      "当前正在普通浏览器/编辑器网页中访问 localhost:1420，无法连接 Rust 桌面后端。请切换到 pnpm tauri dev 自动弹出的 Skippy 桌面独立窗口（若已隐藏到托盘，可按 Alt+Space 或点击右下角托盘图标唤醒）。";
+    loading.value = false;
+    return;
+  }
+
+  loadError.value = "";
   try {
     const snap = await invoke<AppSnapshot>("get_app_snapshot");
     status.value = snap.status;
@@ -85,6 +96,9 @@ async function loadSnapshot() {
       activeSessionId.value = snap.sessions[0].id;
       await loadMessages(snap.sessions[0].id);
     }
+  } catch (err) {
+    status.value.stage_label = "后端连接异常";
+    loadError.value = `无法读取 Skippy 桌面后端状态：${String(err)}`;
   } finally {
     loading.value = false;
   }
@@ -247,6 +261,13 @@ onMounted(() => {
 
     <!-- Main Chat Panel -->
     <div class="flex min-w-0 flex-1 flex-col bg-white dark:bg-zinc-950">
+      <div
+        v-if="loadError"
+        class="border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300"
+      >
+        {{ loadError }}
+      </div>
+
       <!-- Top Bar -->
       <header class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
         <div class="flex items-center gap-2.5">
